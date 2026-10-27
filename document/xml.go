@@ -153,8 +153,9 @@ type xmlPgMar struct {
 // document order in Items: a hyperlink or field sits mid-paragraph, so ordering
 // its wrapped runs among the ordinary ones matters for the text to read right.
 type xmlParagraph struct {
-	Props *xmlPPr
-	Items []xmlParaChild
+	Props     *xmlPPr
+	Items     []xmlParaChild
+	Bookmarks []string
 }
 
 // xmlParaChild is one ordered child of a paragraph: exactly one field is non-nil.
@@ -205,6 +206,16 @@ func (xp *xmlParagraph) UnmarshalXML(d *xml.Decoder, _ xml.StartElement) error {
 				return err
 			}
 			xp.Items = append(xp.Items, xmlParaChild{Hyperlink: &h})
+		case "bookmarkStart":
+			var b struct {
+				Name string `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main name,attr"`
+			}
+			if err := d.DecodeElement(&b, &start); err != nil {
+				return err
+			}
+			if b.Name != "" {
+				xp.Bookmarks = append(xp.Bookmarks, b.Name)
+			}
 		case "fldSimple":
 			var fs xmlFldSimple
 			if err := d.DecodeElement(&fs, &start); err != nil {
@@ -283,15 +294,17 @@ func mergeTabs(own, inherited *xmlTabs) *xmlTabs {
 }
 
 // tabStopsFrom resolves merged w:tabs into the paragraph's stops, sorted by
-// position. A bar tab only draws a vertical rule, which is not modeled, and is
-// no stop at all, so it is dropped.
+// position. A bar tab is kept as TabBar: the layout never stops at it, only
+// draws its rule.
 func tabStopsFrom(t *xmlTabs) []TabStop {
 	var out []TabStop
 	for _, x := range t.list() {
 		stop := TabStop{PosPt: dxaToPt(x.Pos), Leader: tabLeaders[strings.ToLower(strings.TrimSpace(x.Leader))]}
 		switch strings.ToLower(strings.TrimSpace(x.Val)) {
-		case "clear", "bar":
+		case "clear":
 			continue
+		case "bar":
+			stop.Align, stop.Leader = TabBar, ""
 		case "center":
 			stop.Align = TabCenter
 		case "right", "end":
@@ -366,6 +379,10 @@ type xmlRunContent struct {
 	InstrText *string
 	// Tab is a <w:tab/>: an advance to the paragraph's next tab stop.
 	Tab bool
+	// NoteRef is a w:footnoteReference/w:endnoteReference; NoteMark is the
+	// w:footnoteRef/w:endnoteRef that shows a note's own number inside it.
+	NoteRef  *xmlNoteRef
+	NoteMark bool
 }
 
 func (r *xmlRun) UnmarshalXML(d *xml.Decoder, _ xml.StartElement) error {
@@ -420,6 +437,18 @@ func (r *xmlRun) UnmarshalXML(d *xml.Decoder, _ xml.StartElement) error {
 				return err
 			}
 			r.Content = append(r.Content, xmlRunContent{Tab: true})
+		case "footnoteReference", "endnoteReference":
+			var ref xmlNoteRef
+			if err := d.DecodeElement(&ref, &start); err != nil {
+				return err
+			}
+			ref.endnote = start.Name.Local == "endnoteReference"
+			r.Content = append(r.Content, xmlRunContent{NoteRef: &ref})
+		case "footnoteRef", "endnoteRef":
+			if err := d.Skip(); err != nil {
+				return err
+			}
+			r.Content = append(r.Content, xmlRunContent{NoteMark: true})
 		case "noBreakHyphen":
 			if err := d.Skip(); err != nil {
 				return err
@@ -470,6 +499,8 @@ type xmlRPr struct {
 	Color     *xmlColor  `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main color"`
 	Shd       *xmlShd    `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main shd"`
 	Highlight *xmlVal    `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main highlight"`
+	VertAlign *xmlVal    `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main vertAlign"`
+	Position  *xmlVal    `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main position"`
 }
 
 // xmlColor is <w:color>: an explicit sRGB hex value (w:val, or "auto") and/or a
@@ -507,10 +538,12 @@ type xmlFldChar struct {
 }
 
 // xmlHyperlink is <w:hyperlink>: its wrapped runs (whose text would otherwise be
-// dropped, since they are not direct <w:r> children of the paragraph). The
-// target URL (r:id / w:anchor) is not yet turned into a clickable annotation.
+// dropped, since they are not direct <w:r> children of the paragraph) and its
+// target - an external relationship (r:id), a bookmark (w:anchor), or both.
 type xmlHyperlink struct {
-	Runs []xmlRun `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main r"`
+	ID     string   `xml:"http://schemas.openxmlformats.org/officeDocument/2006/relationships id,attr"`
+	Anchor string   `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main anchor,attr"`
+	Runs   []xmlRun `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main r"`
 }
 
 // xmlFldSimple is <w:fldSimple w:instr="…">: a self-contained field carrying its
@@ -562,9 +595,8 @@ type xmlTblPr struct {
 }
 
 // xmlTblPPr is <w:tblpPr>: a floating table's offset from - or alignment
-// against - its horizontal and vertical anchors. The distances it keeps from the
-// surrounding text (w:leftFromText and friends) are out of scope: the text does
-// not wrap around the table.
+// against - its horizontal and vertical anchors, and the distances the text
+// wrapping around it keeps.
 type xmlTblPPr struct {
 	X          string `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main tblpX,attr"`
 	Y          string `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main tblpY,attr"`
@@ -572,6 +604,11 @@ type xmlTblPPr struct {
 	YSpec      string `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main tblpYSpec,attr"`
 	HorzAnchor string `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main horzAnchor,attr"`
 	VertAnchor string `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main vertAnchor,attr"`
+	// The *FromText attributes are the clearance the text keeps, in dxa.
+	LeftFromText   string `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main leftFromText,attr"`
+	RightFromText  string `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main rightFromText,attr"`
+	TopFromText    string `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main topFromText,attr"`
+	BottomFromText string `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main bottomFromText,attr"`
 }
 
 // xmlTblLayout is <w:tblLayout>: "fixed" (the declared widths are final) or
@@ -1262,6 +1299,8 @@ func mergeRPr(own, fallback *xmlRPr) *xmlRPr {
 		Color:     coalesceColor(o.Color, f.Color),
 		Shd:       coalesceShd(o.Shd, f.Shd),
 		Highlight: coalesceVal(o.Highlight, f.Highlight),
+		VertAlign: coalesceVal(o.VertAlign, f.VertAlign),
+		Position:  coalesceVal(o.Position, f.Position),
 	}
 }
 
@@ -1364,6 +1403,14 @@ type styleContext struct {
 	themeFonts map[string]string
 	images     *imageResolver
 	numbering  *numberingState
+	// defaultTabPt is word/settings.xml's w:defaultTabStop, in points (0 when
+	// the document declares none).
+	defaultTabPt float64
+	// footnotes/endnotes number and build the notes the body references (nil
+	// for a document without them, and inside a note); noteMark is the number
+	// of the note being built, which its w:footnoteRef/w:endnoteRef shows.
+	footnotes, endnotes *noteSource
+	noteMark            string
 }
 
 // underPPr is the paragraph-property tier beneath the named styles: the table
@@ -1465,6 +1512,7 @@ func buildParagraph(xp xmlParagraph, sc styleContext) Paragraph {
 		tabs = mergeTabs(inlinePPr.Tabs, tabs)
 	}
 	p.Props.Tabs = tabStopsFrom(tabs)
+	p.Props.DefaultTabStopPt = sc.defaultTabPt
 
 	// Numbering: prepend a marker run and (when the paragraph declared no
 	// indent) borrow the level's hanging indent.
@@ -1492,13 +1540,20 @@ func buildParagraph(xp xmlParagraph, sc styleContext) Paragraph {
 			// A hyperlink's runs carry the "Hyperlink" character style, so they
 			// pick up its blue/underline through the ordinary rStyle resolution;
 			// surfacing them here is what stops the link text from vanishing.
+			from := len(p.Runs)
 			for _, xr := range item.Hyperlink.Runs {
 				appendRun(&p, xr, pStyleRPr, sc, &fld)
+			}
+			if target := sc.images.linkTarget(item.Hyperlink.ID, item.Hyperlink.Anchor); target != "" {
+				for i := from; i < len(p.Runs); i++ {
+					p.Runs[i].Link = target
+				}
 			}
 		case item.FldSimple != nil:
 			appendSimpleField(&p, *item.FldSimple, pStyleRPr, sc, fld.lead)
 		}
 	}
+	p.Bookmarks = xp.Bookmarks
 	return p
 }
 
@@ -1578,6 +1633,16 @@ func appendRun(p *Paragraph, xr xmlRun, pStyleRPr *xmlRPr, sc styleContext, fld 
 			}
 		case c.Tab:
 			p.Runs = append(p.Runs, Run{Tab: true, Props: props})
+		case c.NoteRef != nil:
+			ns := sc.footnotes
+			if c.NoteRef.endnote {
+				ns = sc.endnotes
+			}
+			if note, mark := ns.reference(c.NoteRef.ID, sc); note != nil {
+				p.Runs = append(p.Runs, Run{Text: mark, Props: noteMarkProps(props), Note: note})
+			}
+		case c.NoteMark && sc.noteMark != "":
+			p.Runs = append(p.Runs, Run{Text: sc.noteMark, Props: noteMarkProps(props)})
 		case c.Text != nil && *c.Text != "":
 			p.Runs = append(p.Runs, Run{Text: *c.Text, Props: props})
 		}
@@ -1626,14 +1691,14 @@ func markerRun(m marker, ind Indent, sc styleContext) Run {
 	props := runPropsFrom(mergeRPr(m.rpr, sc.underRPr()), sc)
 	if m.image != nil {
 		r := Run{Image: m.image, Props: props}
-		r.MinWidthPt = markerAdvance(m.suff, ind)
+		r.MinWidthPt = markerAdvance(m.suff, ind, sc.defaultTabPt)
 		return r
 	}
 	text := m.text
 	if strings.EqualFold(m.suff, "space") {
 		text += " "
 	}
-	return Run{Text: text, Props: props, MinWidthPt: markerAdvance(m.suff, ind)}
+	return Run{Text: text, Props: props, MinWidthPt: markerAdvance(m.suff, ind, sc.defaultTabPt)}
 }
 
 // defaultTabStopPt is the tab interval used when a list marker's tab suffix has
@@ -1642,12 +1707,13 @@ const defaultTabStopPt = 36.0
 
 // markerAdvance is the minimum width a marker run occupies. Only the "tab"
 // suffix (the default) reserves space: up to the level's hanging indent, or one
-// default tab stop when the level declares none.
+// default tab stop (defaultTab, or Word's half inch when that is zero) when the
+// level declares none.
 //
 // ponytail: a marker wider than that advance is simply followed by the text,
 // where Word would jump to the next tab stop; add real tab stops if a list ever
 // needs them.
-func markerAdvance(suff string, ind Indent) float64 {
+func markerAdvance(suff string, ind Indent, defaultTab float64) float64 {
 	switch strings.ToLower(strings.TrimSpace(suff)) {
 	case "space", "nothing":
 		return 0
@@ -1655,7 +1721,7 @@ func markerAdvance(suff string, ind Indent) float64 {
 	if ind.FirstLineOffsetPt < 0 { // a hanging indent: the text resumes at LeftPt
 		return -ind.FirstLineOffsetPt
 	}
-	return defaultTabStopPt
+	return cmp.Or(defaultTab, defaultTabStopPt)
 }
 
 // jc/ind/spacing are nil-safe accessors for a paragraph's inline w:pPr fields.
@@ -1845,8 +1911,28 @@ func runPropsFrom(rpr *xmlRPr, sc styleContext) RunProperties {
 	props.Color = resolveColor(rpr.Color, sc.theme)
 	// A highlight sits on top of any shading, so it wins when a run carries both.
 	props.Shading = firstNonEmpty(highlightHex(rpr.Highlight), resolveShading(rpr.Shd, sc.theme))
+	if rpr.Position != nil {
+		if hp, err := strconv.ParseFloat(strings.TrimSpace(rpr.Position.Val), 64); err == nil {
+			props.BaselineShiftPt = hp / 2 // half-points → points
+		}
+	}
+	if rpr.VertAlign != nil {
+		// Word sets superscript and subscript at about two thirds of the size,
+		// raised by a third of it or lowered by a seventh.
+		switch strings.ToLower(strings.TrimSpace(rpr.VertAlign.Val)) {
+		case "superscript":
+			props.BaselineShiftPt += props.SizePt / 3
+			props.SizePt *= superSubScale
+		case "subscript":
+			props.BaselineShiftPt -= props.SizePt / 7
+			props.SizePt *= superSubScale
+		}
+	}
 	return props
 }
+
+// superSubScale is how much smaller superscript and subscript text is drawn.
+const superSubScale = 0.65
 
 // resolveFontFamily resolves a w:rFonts into a typeface name: an explicit
 // w:ascii/w:hAnsi wins, else the theme reference (w:asciiTheme/w:hAnsiTheme) is
@@ -2016,28 +2102,34 @@ func tblWidth(w *xmlTblWidth) (pt, pct float64) {
 }
 
 // tableFloatFrom resolves <w:tblpPr> into the public placement (nil when the
-// table is not floating).
-func tableFloatFrom(p *xmlTblPPr) *TableFloat {
+// table is not floating). The text always wraps around a floating table.
+func tableFloatFrom(p *xmlTblPPr) *Float {
 	if p == nil {
 		return nil
 	}
-	return &TableFloat{
-		XPt:        dxaToPt(p.X),
-		YPt:        dxaToPt(p.Y),
-		HorzAnchor: anchorFrom(p.HorzAnchor),
-		VertAnchor: anchorFrom(p.VertAnchor),
-		XSpec:      strings.ToLower(strings.TrimSpace(p.XSpec)),
-		YSpec:      strings.ToLower(strings.TrimSpace(p.YSpec)),
+	return &Float{
+		XPt:          dxaToPt(p.X),
+		YPt:          dxaToPt(p.Y),
+		HorzAnchor:   anchorFrom(p.HorzAnchor),
+		VertAnchor:   anchorFrom(p.VertAnchor),
+		XSpec:        strings.ToLower(strings.TrimSpace(p.XSpec)),
+		YSpec:        strings.ToLower(strings.TrimSpace(p.YSpec)),
+		DistLeftPt:   max(dxaToPt(p.LeftFromText), 0),
+		DistRightPt:  max(dxaToPt(p.RightFromText), 0),
+		DistTopPt:    max(dxaToPt(p.TopFromText), 0),
+		DistBottomPt: max(dxaToPt(p.BottomFromText), 0),
 	}
 }
 
-// anchorFrom resolves w:horzAnchor/w:vertAnchor; the default (and anything
-// unknown) anchors to the text.
+// anchorFrom resolves w:horzAnchor/w:vertAnchor, or a picture's relativeFrom;
+// the default (and anything unknown - column, character, paragraph, line)
+// anchors to the text. The margin areas are approximated: those that start at
+// the page's edge by the page, the others by the margin.
 func anchorFrom(v string) Anchor {
 	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "margin":
+	case "margin", "rightmargin", "bottommargin", "insidemargin", "outsidemargin":
 		return AnchorMargin
-	case "page":
+	case "page", "leftmargin", "topmargin":
 		return AnchorPage
 	default:
 		return AnchorText

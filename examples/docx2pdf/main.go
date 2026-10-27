@@ -2,10 +2,14 @@
 //
 // Usage:
 //
-//	docx2pdf <input.docx> <output.pdf>
+//	docx2pdf [-system-fonts] <input.docx> <output.pdf>
+//
+// -system-fonts draws text in the fonts installed on this machine when the
+// document asks for one, instead of the bundled metric-compatible replacements.
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -14,11 +18,13 @@ import (
 )
 
 func main() {
-	if len(os.Args) != 3 {
-		fmt.Fprintf(os.Stderr, "usage: %s <input.docx> <output.pdf>\n", os.Args[0])
+	systemFonts := flag.Bool("system-fonts", false, "use the fonts installed on this machine")
+	flag.Parse()
+	if flag.NArg() != 2 {
+		fmt.Fprintf(os.Stderr, "usage: %s [-system-fonts] <input.docx> <output.pdf>\n", os.Args[0])
 		os.Exit(2)
 	}
-	in, out := os.Args[1], os.Args[2]
+	in, out := flag.Arg(0), flag.Arg(1)
 
 	doc, err := document.Open(in)
 	if err != nil {
@@ -26,7 +32,11 @@ func main() {
 	}
 	defer func() { _ = doc.Close() }()
 
-	if err := doc.WritePDF(out); err != nil {
+	conv := document.ConvertToPdf(doc)
+	if *systemFonts {
+		conv.WithSystemFonts()
+	}
+	if err := conv.WriteToFile(out); err != nil {
 		log.Fatal(err)
 	}
 	fmt.Printf("wrote %s\n", out)

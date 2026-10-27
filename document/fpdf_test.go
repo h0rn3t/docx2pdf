@@ -44,7 +44,7 @@ func TestMapFontFamily(t *testing.T) {
 }
 
 func TestTrivialRenderEmitsPDF(t *testing.T) {
-	r := newFPDFRenderer(testGeometry.WidthPt, testGeometry.HeightPt)
+	r := newFPDFRenderer(testGeometry.WidthPt, testGeometry.HeightPt, nil, nil)
 	r.AddPage(testGeometry.WidthPt, testGeometry.HeightPt)
 	r.SetFont(fonts.Sans, true, false, true, 12)
 	r.DrawText(marginPt, 120, "hello")

@@ -31,6 +31,20 @@ type fakeRenderer struct {
 	pages     []pageCall
 	rotations []rotateCall
 	clips     []clipCall
+	links     []linkCall
+	anchors   []anchorCall
+}
+
+type linkCall struct {
+	page       int
+	x, y, w, h float64
+	target     string
+}
+
+type anchorCall struct {
+	page int
+	name string
+	y    float64
 }
 
 // rotateCall is one Rotate/RotateEnd block: the transform and the range of
@@ -106,7 +120,7 @@ func testFlow(f *fakeRenderer) *flow {
 		Geometry: g,
 		Columns:  []Column{{WidthPt: g.WidthPt - g.MarginLeftPt - g.MarginRightPt}},
 	})
-	return &flow{r: f, sec: sec, y: sec.cols[0].originY, atTop: true}
+	return &flow{r: f, sec: sec, y: sec.cols[0].originY, top: sec.cols[0].originY, bottom: sec.cols[0].bottomLimit, atTop: true}
 }
 func (f *fakeRenderer) FillRect(x, y, w, h float64, colorHex string) {
 	f.fills = append(f.fills, fillCall{page: f.page, x: x, y: y, w: w, h: h, color: colorHex})
@@ -138,6 +152,14 @@ func (f *fakeRenderer) ClipEnd() {
 	if n := len(f.clips); n > 0 {
 		f.clips[n-1].to = len(f.draws)
 	}
+}
+
+func (f *fakeRenderer) Link(x, y, w, h float64, target string) {
+	f.links = append(f.links, linkCall{page: f.page, x: x, y: y, w: w, h: h, target: target})
+}
+
+func (f *fakeRenderer) Anchor(name string, y float64) {
+	f.anchors = append(f.anchors, anchorCall{page: f.page, name: name, y: y})
 }
 
 func (f *fakeRenderer) Output(io.Writer) error { return nil }

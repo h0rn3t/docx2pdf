@@ -51,6 +51,10 @@ type RunProperties struct {
 	// none: the run's w:highlight, or - when it carries none - its w:shd, which
 	// the highlight would paint over anyway.
 	Shading string
+	// BaselineShiftPt raises the text above the line's baseline, or lowers it
+	// when negative: w:position, plus superscript/subscript (w:vertAlign), whose
+	// text SizePt already gives at its reduced size.
+	BaselineShiftPt float64
 }
 
 // Image is a picture embedded in the document, ready to be drawn: the media
@@ -66,6 +70,18 @@ type Image struct {
 	// WidthPt/HeightPt are the drawn size, from the picture's declared extent or
 	// - when it declares none - its intrinsic pixel size at 96 dpi.
 	WidthPt, HeightPt float64
+	// Crop is how much of the picture is cut away (a:srcRect); the rest is
+	// stretched to WidthPt × HeightPt.
+	Crop Crop
+	// Float is a floating picture's placement (wp:anchor), or nil for one that
+	// sits in the line like a glyph.
+	Float *Float
+}
+
+// Crop is the fraction of a picture cut away from each side (a:srcRect): 0.25
+// for Left drops its left quarter. A negative value pads that side instead.
+type Crop struct {
+	Left, Top, Right, Bottom float64
 }
 
 // Run is a span of text sharing one set of character-formatting properties, an
@@ -98,6 +114,32 @@ type Run struct {
 	// paragraph's next tab stop (ParagraphProperties.Tabs, then the default
 	// half-inch grid).
 	Tab bool
+	// Link is the target of the hyperlink (w:hyperlink) the run sits in: an
+	// external URL, or "#name" for a bookmark in the document (w:anchor). The
+	// run's drawn area becomes a clickable link to it. "" for no link.
+	Link string
+	// Note is the footnote or endnote this run references (Text is its
+	// number), or nil.
+	Note *Note
+}
+
+// Font is one face of a font embedded in the document.
+type Font struct {
+	// Family is the name runs refer to it by (w:rFonts), e.g. "Calibri".
+	Family       string
+	Bold, Italic bool
+	// Data is the font file (TrueType or OpenType), deobfuscated.
+	Data []byte
+}
+
+// Note is a footnote's or an endnote's content.
+type Note struct {
+	// Body is the note's paragraphs and tables; the first paragraph normally
+	// starts with the note's number.
+	Body []BodyElement
+	// Endnote reports an endnote: it is printed at the end of the document
+	// (Document.Endnotes), not at the foot of the page its reference is on.
+	Endnote bool
 }
 
 // Field kinds a Run may carry (see Run.Field). Only page-number fields are
@@ -132,6 +174,10 @@ type ParagraphProperties struct {
 	// Tabs are the paragraph's custom tab stops (w:tabs, merged down its style
 	// chain), sorted by position.
 	Tabs []TabStop
+	// DefaultTabStopPt is the step of the implicit tab grid past the last
+	// custom stop (word/settings.xml's w:defaultTabStop); zero means Word's
+	// default half inch.
+	DefaultTabStopPt float64
 }
 
 // TabAlign is how text aligns against a tab stop (w:tab/@w:val).
@@ -144,9 +190,13 @@ const (
 	TabCenter
 	// TabRight ends it at the stop.
 	TabRight
-	// TabDecimal aligns its decimal point on the stop; it is laid out as
-	// TabRight, which matches it for text with no fractional part.
+	// TabDecimal aligns its decimal separator (the last "." or "," between
+	// digits) on the stop; text with no such separator ends at the stop, as
+	// with TabRight.
 	TabDecimal
+	// TabBar is no stop at all: a tab never advances to it. It draws a
+	// vertical rule at its position down each line of the paragraph.
+	TabBar
 )
 
 // TabStop is one custom tab stop.
@@ -204,6 +254,9 @@ type Spacing struct {
 type Paragraph struct {
 	Runs  []Run
 	Props ParagraphProperties
+	// Bookmarks are the names of the bookmarks (w:bookmarkStart) inside the
+	// paragraph: a Run.Link of "#name" jumps to the paragraph's first line.
+	Bookmarks []string
 }
 
 // BodyElement is one paragraph- or table-level child of a Document's body, in
@@ -246,16 +299,18 @@ type Table struct {
 	WidthPct float64
 	// Float is a floating table's placement (w:tblpPr), or nil for one that flows
 	// with the text.
-	Float *TableFloat
+	Float *Float
 }
 
-// Anchor is what a floating table's position is measured from (w:horzAnchor /
-// w:vertAnchor).
+// Anchor is what a floating object's position is measured from (a table's
+// w:horzAnchor/w:vertAnchor, a picture's wp:positionH/wp:positionV
+// relativeFrom).
 type Anchor int
 
 const (
-	// AnchorText is the default: the position is measured from the text column
-	// the table sits in.
+	// AnchorText is the default: horizontally the position is measured from the
+	// text column the object sits in, vertically from the paragraph (or, for a
+	// table, the place in the text) it is anchored at.
 	AnchorText Anchor = iota
 	// AnchorMargin measures from the page's margin.
 	AnchorMargin
@@ -263,15 +318,39 @@ const (
 	AnchorPage
 )
 
-// TableFloat is a floating table's placement (w:tblpPr): an offset from its
-// anchor, or - when the document names one instead - an alignment against it.
-type TableFloat struct {
+// Wrap is how the text around a floating object makes room for it.
+type Wrap int
+
+const (
+	// WrapAround flows the text down the wider side of the object: the default
+	// for a floating table, and a picture's wp:wrapSquare/wrapTight/wrapThrough.
+	WrapAround Wrap = iota
+	// WrapTopAndBottom keeps the lines beside the object clear: the text resumes
+	// below it (wp:wrapTopAndBottom).
+	WrapTopAndBottom
+	// WrapNone lets the text run over or under the object (wp:wrapNone - a
+	// picture in front of or behind the text).
+	WrapNone
+)
+
+// Float is a floating object's placement: a table's w:tblpPr or a picture's
+// wp:anchor. It is an offset from its anchor, or - when the document names one
+// instead - an alignment against it, plus how the text wraps around it.
+type Float struct {
 	XPt, YPt               float64
 	HorzAnchor, VertAnchor Anchor
-	// XSpec/YSpec are w:tblpXSpec/w:tblpYSpec ("left"/"center"/"right",
-	// "top"/"center"/"bottom"); "" means the offset is used instead.
+	// XSpec/YSpec are w:tblpXSpec/w:tblpYSpec, or a picture's wp:align
+	// ("left"/"center"/"right", "top"/"center"/"bottom"); "" means the offset is
+	// used instead.
 	XSpec, YSpec string
+	Wrap         Wrap
+	// Dist*Pt are the clearance the text keeps from the object on each side
+	// (w:leftFromText and the like, a picture's distL/distR/distT/distB).
+	DistLeftPt, DistRightPt, DistTopPt, DistBottomPt float64
 }
+
+// TableFloat is Float's former name, kept so existing code still compiles.
+type TableFloat = Float
 
 // RowHeightRule is how a row's declared height (w:trHeight) constrains it.
 type RowHeightRule int
@@ -428,6 +507,12 @@ type Document struct {
 	// Sections are the document's sections in order, each covering the range of
 	// Body that ends at its End index. There is always at least one.
 	Sections []Section
+	// Endnotes is the content of every endnote, in the order the body
+	// references them; it is printed after the body.
+	Endnotes []BodyElement
+	// Fonts are the font faces the document embeds (word/fontTable.xml),
+	// ready to use: text in one of their families is drawn in them.
+	Fonts []Font
 
 	mu     sync.Mutex
 	closed bool
@@ -478,6 +563,19 @@ func Open(path string) (*Document, error) {
 		// resolves through that part's own relationships.
 		numbering: newNumberingState(buildNumbering(numbering, p.resolverFor(numberingName))),
 	}
+	footFmt, endFmt := "decimal", "lowerRoman"
+	if settings != nil && settings.FootnotePr != nil && settings.FootnotePr.NumFmt != nil {
+		footFmt = settings.FootnotePr.NumFmt.Val
+	}
+	if settings != nil && settings.EndnotePr != nil && settings.EndnotePr.NumFmt != nil {
+		endFmt = settings.EndnotePr.NumFmt.Val
+	}
+	sc.footnotes = newNoteSource(p, p.relatedPart(mainName, "footnotes", pathpkg.Join(dir, "footnotes.xml")), footFmt, false)
+	sc.endnotes = newNoteSource(p, p.relatedPart(mainName, "endnotes", pathpkg.Join(dir, "endnotes.xml")), endFmt, true)
+	if settings != nil && settings.DefaultTabStop != nil {
+		// A non-positive step would make the implicit tab grid never advance.
+		sc.defaultTabPt = max(dxaToPt(settings.DefaultTabStop.Val), 0)
+	}
 	if xs != nil && xs.DocDefaults != nil {
 		if xs.DocDefaults.PPrDefault != nil {
 			sc.defaultPPr = xs.DocDefaults.PPrDefault.PPr
@@ -490,11 +588,16 @@ func Open(path string) (*Document, error) {
 	body, breaks := buildBody(xdoc.Body, sc)
 	evenAndOdd := settings != nil && settings.EvenAndOddHeaders.on()
 	sections := buildSections(breaks, xdoc.Body.SectPr, len(body), evenAndOdd, p, sc)
-	return &Document{
+	doc := &Document{
 		Body:     body,
 		Geometry: sections[0].Geometry,
 		Sections: sections,
-	}, nil
+	}
+	if sc.endnotes != nil {
+		doc.Endnotes = sc.endnotes.built
+	}
+	doc.Fonts = embeddedFonts(p, p.relatedPart(mainName, "fontTable", pathpkg.Join(dir, "fontTable.xml")))
+	return doc, nil
 }
 
 // optionalPart decodes a supporting part (styles, theme, numbering) into T.

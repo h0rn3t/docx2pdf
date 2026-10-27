@@ -89,9 +89,13 @@ type Section struct {
 	HeaderOffsetPt, FooterOffsetPt float64
 }
 
-// xmlSettings is word/settings.xml; only the even/odd header switch is modeled.
+// xmlSettings is word/settings.xml; only the even/odd header switch, the
+// default tab stop and the notes' number formats are modeled.
 type xmlSettings struct {
-	EvenAndOddHeaders *xmlOnOff `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main evenAndOddHeaders"`
+	EvenAndOddHeaders *xmlOnOff  `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main evenAndOddHeaders"`
+	DefaultTabStop    *xmlVal    `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main defaultTabStop"`
+	FootnotePr        *xmlNotePr `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main footnotePr"`
+	EndnotePr         *xmlNotePr `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main endnotePr"`
 }
 
 // sectionBreak records a mid-body w:sectPr: the section's properties and the

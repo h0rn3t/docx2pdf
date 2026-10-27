@@ -8,12 +8,16 @@ import (
 	"image"
 	"image/png"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
+
+	"golang.org/x/image/bmp"
+	"golang.org/x/image/tiff"
 
 	"github.com/h0rn3t/docx2pdf/internal/docxtest"
 )
@@ -189,6 +193,8 @@ func TestImages_ThatTheBackendWouldRejectDoNotFailThePDF(t *testing.T) {
 		{"interlaced png", "media/image1.png", interlacedPNG(t), "PNG"},
 		{"png named .jpg", "media/image1.jpg", docxtest.PNG(t, 2, 2), "PNG"},
 		{"corrupt png", "media/image1.png", "not an image", ""},
+		{"tiff", "media/image1.tiff", encoded(t, func(w io.Writer, m image.Image) error { return tiff.Encode(w, m, nil) }), "PNG"},
+		{"bmp", "media/image1.bmp", encoded(t, bmp.Encode), "PNG"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -205,6 +211,16 @@ func TestImages_ThatTheBackendWouldRejectDoNotFailThePDF(t *testing.T) {
 			}
 		})
 	}
+}
+
+// encoded is a 2×2 picture written by encode.
+func encoded(t *testing.T, encode func(io.Writer, image.Image) error) string {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := encode(&buf, image.NewRGBA(image.Rect(0, 0, 2, 2))); err != nil {
+		t.Fatal(err)
+	}
+	return buf.String()
 }
 
 // interlacedPNG is a 1×1 PNG flagged Adam7-interlaced. A single pixel's
@@ -501,6 +517,30 @@ func TestTabs_AdvanceToTheirStops(t *testing.T) {
 			text:  "c", wantX: 50,
 		},
 		{
+			name:  "document's own default grid",
+			props: ParagraphProperties{DefaultTabStopPt: 50},
+			runs:  []Run{run("ab", 12), tab, run("c", 12), tab, run("d", 12)},
+			text:  "d", wantX: 100,
+		},
+		{
+			name:  "decimal stop aligns the separator",
+			props: ParagraphProperties{Tabs: []TabStop{{PosPt: 200, Align: TabDecimal}}},
+			runs:  []Run{tab, run("12,50", 12)}, // "12" is 12 pt wide
+			text:  "12,50", wantX: 188,
+		},
+		{
+			name:  "decimal stop without a separator ends the text there",
+			props: ParagraphProperties{Tabs: []TabStop{{PosPt: 200, Align: TabDecimal}}},
+			runs:  []Run{tab, run("125", 12)},
+			text:  "125", wantX: 182,
+		},
+		{
+			name:  "bar stop is skipped",
+			props: ParagraphProperties{Tabs: []TabStop{{PosPt: 40, Align: TabBar}, {PosPt: 100}}},
+			runs:  []Run{run("ab", 12), tab, run("c", 12)},
+			text:  "c", wantX: 100,
+		},
+		{
 			name:  "hanging indent is a stop",
 			props: ParagraphProperties{Indent: Indent{LeftPt: 30, FirstLineOffsetPt: -30}},
 			runs:  []Run{run("1.", 12), tab, run("c", 12)},
@@ -539,6 +579,55 @@ func TestTabs_DotLeaderFillsTheSpan(t *testing.T) {
 	// left off so the leader stops short of the text on either side.
 	if want := strings.Repeat(".", 26); leader != want {
 		t.Errorf("leader = %q (%d dots), want %d dots", leader, len(leader), len(want))
+	}
+}
+
+func TestTabs_BarStopDrawsARuleDownEachLine(t *testing.T) {
+	p := Paragraph{
+		Runs:  []Run{run("a", 12), {LineBreak: true}, run("b", 12)},
+		Props: ParagraphProperties{Tabs: []TabStop{{PosPt: 40, Align: TabBar}}},
+	}
+	f := &fakeRenderer{}
+	ConvertToPdf(&Document{Body: bodyOf(p)}).render(f)
+
+	x := testPage.originX + 40
+	if len(f.strokes) != 2 {
+		t.Fatalf("strokes = %+v, want one rule per line", f.strokes)
+	}
+	for _, s := range f.strokes {
+		if s.x1 != x || s.x2 != x || math.Abs(s.y2-s.y1-12*lineSpacing) > 1e-9 {
+			t.Errorf("rule = %+v, want a line-high vertical at x=%.1f", s, x)
+		}
+	}
+}
+
+func TestJustify_StretchesOnlyAfterTheLastTab(t *testing.T) {
+	tab := Run{Tab: true, Props: RunProperties{SizePt: 12}}
+	text := strings.TrimSpace(strings.Repeat("ab ", 40))
+	p := Paragraph{
+		Runs:  []Run{run("x y", 12), tab, run(text, 12)},
+		Props: ParagraphProperties{Alignment: AlignJustify},
+	}
+	f := &fakeRenderer{}
+	ConvertToPdf(&Document{Body: bodyOf(p)}).render(f)
+
+	// "x" and "y" sit before the tab, so the space between them stays 6 pt.
+	if got := drawnX(t, f, "y") - drawnX(t, f, "x"); got != 12 {
+		t.Errorf("y - x = %.2f, want 12 (no stretch before the tab)", got)
+	}
+}
+
+func TestOpen_DefaultTabStopAndBarTab(t *testing.T) {
+	doc := openFixture(t, docxtest.BuildWith(t,
+		`<w:p><w:pPr><w:tabs><w:tab w:val="bar" w:pos="720"/></w:tabs></w:pPr><w:r><w:t>a</w:t></w:r></w:p>`,
+		map[string]string{"word/settings.xml": `<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">` +
+			`<w:defaultTabStop w:val="1134"/></w:settings>`}))
+	props := doc.Body[0].Paragraph.Props
+	if props.DefaultTabStopPt != 56.7 {
+		t.Errorf("DefaultTabStopPt = %v, want 56.7", props.DefaultTabStopPt)
+	}
+	if want := []TabStop{{PosPt: 36, Align: TabBar}}; !slices.Equal(props.Tabs, want) {
+		t.Errorf("tabs = %+v, want %+v", props.Tabs, want)
 	}
 }
 

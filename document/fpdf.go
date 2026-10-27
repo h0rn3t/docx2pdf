@@ -2,11 +2,14 @@ package document
 
 import (
 	"bytes"
+	"encoding/binary"
+	"fmt"
 	"io"
 	"strconv"
 	"strings"
 
 	"github.com/go-pdf/fpdf"
+	"golang.org/x/image/font/sfnt"
 
 	"github.com/h0rn3t/docx2pdf/document/fonts"
 )
@@ -20,6 +23,33 @@ type fpdfRenderer struct {
 	// the backend (true) or was rejected by it (false), so a picture drawn on
 	// many pages is embedded - or turned down - once.
 	images map[string]bool
+	// anchors maps a bookmark name to the backend's internal link id; placed
+	// records which of them Anchor has given a destination.
+	anchors map[string]int
+	placed  map[string]bool
+	// faces are the real fonts - embedded in the document, or installed -
+	// registered with the backend, by face; a nil entry remembers a face that
+	// was looked for and is not available.
+	faces map[faceKey]*realFace
+	// system finds installed fonts, or is nil when they are not used.
+	system *fontIndex
+	// cur is what the last SetFont asked for; the face it resolves to is
+	// picked per string, since a real font may lack a glyph the string needs.
+	cur    fontRequest
+	glyphs sfnt.Buffer
+}
+
+// realFace is a real font registered with the backend under name, with its
+// parsed outlines to check which characters it has.
+type realFace struct {
+	name string
+	font *sfnt.Font
+}
+
+type fontRequest struct {
+	family                  string
+	bold, italic, underline bool
+	size                    float64
 }
 
 // utf8Styles are the style strings each embedded family is registered under,
@@ -35,23 +65,121 @@ var utf8Styles = []struct {
 }
 
 // newFPDFRenderer creates a backend whose pages are widthPt × heightPt (points),
-// sized from the document's page geometry rather than a fixed A4.
+// sized from the document's page geometry rather than a fixed A4. Text in a
+// family the document embeds (embedded) is drawn in it, and - when system is
+// not nil - text in a family installed on the machine in that font; anything
+// else in a metric-compatible replacement.
 // simplified: no SetMargins - auto page breaks are off and the layout positions
 // all text by absolute coordinates, so fpdf's own margins have no effect here.
-func newFPDFRenderer(widthPt, heightPt float64) *fpdfRenderer {
+func newFPDFRenderer(widthPt, heightPt float64, embedded []Font, system *fontIndex) *fpdfRenderer {
 	pdf := fpdf.NewCustom(&fpdf.InitType{
 		UnitStr: "pt",
 		Size:    fpdf.SizeType{Wd: widthPt, Ht: heightPt},
 	})
 	pdf.SetAutoPageBreak(false, 0) // pagination is handled by the layout
-	pdf.AliasNbPages(nbPagesAlias) // NUMPAGES fields draw the alias; fpdf fills the count
 	for _, family := range fonts.Families {
 		for _, s := range utf8Styles {
 			pdf.AddUTF8FontFromBytes(family, s.str, fonts.Bytes(family, s.bold, s.italic))
 		}
 	}
 	pdf.SetFont(fonts.Sans, "", defaultRenderSizePt) // a font must be set before any text op
-	return &fpdfRenderer{pdf: pdf, images: make(map[string]bool)}
+	r := &fpdfRenderer{
+		pdf: pdf, images: make(map[string]bool), anchors: make(map[string]int), placed: make(map[string]bool),
+		faces: make(map[faceKey]*realFace), system: system,
+		cur: fontRequest{family: fonts.Sans, size: defaultRenderSizePt},
+	}
+	for _, f := range embedded {
+		if k := newFaceKey(f.Family, f.Bold, f.Italic); r.faces[k] == nil {
+			r.faces[k] = r.register(f.Data)
+		}
+	}
+	return r
+}
+
+// register adds a real font to the document, or returns nil when the backend
+// cannot use it.
+func (r *fpdfRenderer) register(data []byte) *realFace {
+	font, err := sfnt.Parse(data)
+	if err != nil || !fpdfAccepts(data) {
+		return nil
+	}
+	name := fmt.Sprintf("real-%d", len(r.faces))
+	r.pdf.AddUTF8FontFromBytes(name, "", data)
+	return &realFace{name: name, font: font}
+}
+
+// fpdfAccepts tries a font on a throwaway document. fpdf takes only TrueType
+// outlines, trusts the file it parses, and on a font it cannot read leaves an
+// error that fails the whole PDF; a font from an untrusted .docx must not get
+// that far, nor crash the conversion with a panic.
+func fpdfAccepts(data []byte) (ok bool) {
+	if len(data) < 4 {
+		return false
+	}
+	if tag := binary.BigEndian.Uint32(data); tag != 0x00010000 && tag != 0x74727565 { // TrueType: 1.0 or "true"
+		return false
+	}
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	probe := fpdf.New("P", "pt", "A4", "")
+	probe.AddUTF8FontFromBytes("probe", "", data)
+	probe.AddPage()
+	probe.SetFont("probe", "", 10)
+	probe.Text(10, 10, "Aa0")
+	return probe.Output(io.Discard) == nil
+}
+
+// face is the real font for a family's face: embedded, or installed when
+// system fonts are in use; nil when there is none.
+func (r *fpdfRenderer) face(family string, bold, italic bool) *realFace {
+	k := newFaceKey(family, bold, italic)
+	f, seen := r.faces[k]
+	if !seen {
+		if data := r.system.lookup(k); data != nil {
+			f = r.register(data)
+		}
+		r.faces[k] = f
+	}
+	return f
+}
+
+// covers reports whether f has a glyph for every character of s.
+func (r *fpdfRenderer) covers(f *realFace, s string) bool {
+	for _, c := range s {
+		if i, err := f.font.GlyphIndex(&r.glyphs, c); err != nil || i == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// selectFont makes the backend's font the one to draw s in: the requested
+// family's real font when there is one that has all of s's characters, else
+// its metric-compatible replacement.
+func (r *fpdfRenderer) selectFont(s string) {
+	c := r.cur
+	if f := r.face(c.family, c.bold, c.italic); f != nil && r.covers(f, s) {
+		style := ""
+		if c.underline {
+			style = "U"
+		}
+		r.pdf.SetFont(f.name, style, c.size)
+		return
+	}
+	var style strings.Builder
+	if c.bold {
+		style.WriteByte('B')
+	}
+	if c.italic {
+		style.WriteByte('I')
+	}
+	if c.underline {
+		style.WriteByte('U')
+	}
+	r.pdf.SetFont(mapFontFamily(c.family), style.String(), c.size)
 }
 
 // defaultRenderSizePt is only the backend's initial font size; every run resets
@@ -59,17 +187,7 @@ func newFPDFRenderer(widthPt, heightPt float64) *fpdfRenderer {
 const defaultRenderSizePt = 11.0
 
 func (r *fpdfRenderer) SetFont(family string, bold, italic, underline bool, sizePt float64) {
-	var style strings.Builder
-	if bold {
-		style.WriteByte('B')
-	}
-	if italic {
-		style.WriteByte('I')
-	}
-	if underline {
-		style.WriteByte('U')
-	}
-	r.pdf.SetFont(mapFontFamily(family), style.String(), sizePt)
+	r.cur = fontRequest{family: family, bold: bold, italic: italic, underline: underline, size: sizePt}
 }
 
 // SetTextColor sets the text fill color from a "#RRGGBB" string; an empty or
@@ -82,7 +200,10 @@ func (r *fpdfRenderer) SetTextColor(colorHex string) {
 	r.pdf.SetTextColor(cr, cg, cb)
 }
 
-func (r *fpdfRenderer) TextWidth(s string) float64 { return r.pdf.GetStringWidth(s) }
+func (r *fpdfRenderer) TextWidth(s string) float64 {
+	r.selectFont(s)
+	return r.pdf.GetStringWidth(s)
+}
 
 // AddPage starts a page of the requested size (each section brings its own, so
 // the size is passed per page rather than fixed at construction).
@@ -92,6 +213,7 @@ func (r *fpdfRenderer) AddPage(widthPt, heightPt float64) {
 
 func (r *fpdfRenderer) DrawText(x, y float64, s string) {
 	if s != "" {
+		r.selectFont(s)
 		r.pdf.Text(x, y, s)
 	}
 }
@@ -156,9 +278,48 @@ func (r *fpdfRenderer) Clip(x, y, w, h float64) {
 
 func (r *fpdfRenderer) ClipEnd() { r.pdf.ClipEnd() }
 
-func (r *fpdfRenderer) Output(w io.Writer) error {
+func (r *fpdfRenderer) Link(x, y, w, h float64, target string) {
+	name, internal := strings.CutPrefix(target, "#")
+	if !internal {
+		r.pdf.LinkString(x, y, w, h, target)
+		return
+	}
+	r.pdf.Link(x, y, w, h, r.anchor(name))
+}
+
+func (r *fpdfRenderer) Anchor(name string, y float64) {
+	r.pdf.SetLink(r.anchor(name), y, -1)
+	r.placed[name] = true
+}
+
+// anchor is the internal link id for a bookmark name, allocated on first use:
+// a table of contents links to headings it has not reached yet.
+func (r *fpdfRenderer) anchor(name string) int {
+	id, ok := r.anchors[name]
+	if !ok {
+		id = r.pdf.AddLink()
+		r.anchors[name] = id
+	}
+	return id
+}
+
+func (r *fpdfRenderer) Output(w io.Writer) (err error) {
 	if err := r.pdf.Error(); err != nil {
 		return err
+	}
+	// Writing subsets every real font to the characters drawn in it; a font
+	// from an untrusted .docx that passed the probe could still trip fpdf here.
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("docx2pdf: write pdf: %v", p)
+		}
+	}()
+	// A link to a bookmark the document never placed would point at page 0,
+	// which does not exist; send it to the top of the first page instead.
+	for name, id := range r.anchors {
+		if !r.placed[name] {
+			r.pdf.SetLink(id, 0, 1)
+		}
 	}
 	return r.pdf.Output(w)
 }

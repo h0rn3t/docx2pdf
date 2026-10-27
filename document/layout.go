@@ -1,6 +1,7 @@
 package document
 
 import (
+	"cmp"
 	"math"
 	"slices"
 	"strings"
@@ -31,6 +32,10 @@ type word struct {
 	// character that stop fills the span with, or "".
 	tab    bool
 	leader string
+	// link is the hyperlink target of the word's run (Run.Link), or "".
+	link string
+	// note is the footnote the word references (Run.Note), or nil.
+	note *Note
 }
 
 // height is what the word contributes to its line's height: a picture's full
@@ -89,49 +94,85 @@ func lineHeightFor(maxSize, maxImg float64, sp Spacing) float64 {
 // wider than width is placed alone on its line and allowed to overflow rather
 // than looping forever. Returns nil for an empty paragraph.
 func layoutParagraph(r renderer, p Paragraph, width float64) []line {
-	words := measureWords(r, p)
-	if len(words) == 0 {
-		return nil
-	}
-
+	b := newLineBreaker(r, p)
 	var lines []line
-	var cur []word
-	var curW, curMax, curImg float64
-	pending := breakNone // a page/column break waiting for the line after it
-	flush := func() {
-		lines = append(lines, line{
-			words:       cur,
-			natural:     curW,
-			maxSize:     curMax,
-			maxImg:      curImg,
-			height:      lineHeightFor(curMax, curImg, p.Props.Spacing),
-			breakBefore: pending,
-		})
-		cur, curW, curMax, curImg, pending = nil, 0, 0, 0, breakNone
+	for ln, ok := b.next(width); ok; ln, ok = b.next(width) {
+		lines = append(lines, ln)
 	}
-	blankLine := func() {
-		lines = append(lines, line{height: lineHeightFor(defaultRenderSizePt, 0, p.Props.Spacing), breakBefore: pending})
-		pending = breakNone
-	}
+	return lines
+}
 
+// lineBreaker packs a paragraph's words into lines one at a time, so that each
+// line can be given its own width: the room a floating object beside it
+// leaves. It is a plain value, so a copy taken before next can pack the same
+// line again at another width.
+type lineBreaker struct {
+	props ParagraphProperties
+	words []word
+	r     renderer
+	i     int // the next word to pack
+	// started reports that a line has been produced: only the first is
+	// shifted by the first-line indent.
+	started bool
 	// hardStart marks a line whose first word may keep its leading whitespace as
 	// an indent: the paragraph's first line and any line after an explicit
 	// <w:br/>. A soft-wrap continuation is not a hard start, so its leading
 	// whitespace is dropped.
-	hardStart := true
-	for i := 0; i < len(words); {
+	hardStart bool
+	pending   frameBreak // a page/column break waiting for the line after it
+}
+
+func newLineBreaker(r renderer, p Paragraph) lineBreaker {
+	return lineBreaker{props: p.Props, words: measureWords(r, p), r: r, hardStart: true}
+}
+
+// done reports whether every line has been produced.
+func (b *lineBreaker) done() bool { return b.i >= len(b.words) && b.pending == breakNone }
+
+// next packs the next line into width, or reports false when there is none.
+func (b *lineBreaker) next(width float64) (line, bool) {
+	var cur []word
+	var curW, curMax, curImg float64
+	flush := func() line {
+		ln := line{
+			words:       cur,
+			natural:     curW,
+			maxSize:     curMax,
+			maxImg:      curImg,
+			height:      lineHeightFor(curMax, curImg, b.props.Spacing),
+			breakBefore: b.pending,
+		}
+		b.pending, b.started = breakNone, true
+		return ln
+	}
+	blankLine := func() line {
+		ln := line{height: lineHeightFor(defaultRenderSizePt, 0, b.props.Spacing), breakBefore: b.pending}
+		b.pending, b.started = breakNone, true
+		return ln
+	}
+
+	words := b.words
+	for b.i < len(words) {
+		i := b.i
 		if w := words[i]; w.lineBreak {
+			var ln line
+			produced := true
 			switch {
 			case len(cur) > 0:
-				flush()
-			case w.frame == breakNone || pending != breakNone:
-				blankLine() // a break on an empty line is a blank line
+				ln = flush()
+			case w.frame == breakNone || b.pending != breakNone:
+				ln = blankLine() // a break on an empty line is a blank line
+			default:
+				produced = false
 			}
 			if w.frame != breakNone {
-				pending = w.frame
+				b.pending = w.frame
 			}
-			hardStart = true
-			i++
+			b.hardStart = true
+			b.i++
+			if produced {
+				return ln, true
+			}
 			continue
 		}
 		// A word Word split across runs (a formatting or revision change
@@ -148,23 +189,20 @@ func layoutParagraph(r renderer, p Paragraph, width float64) []line {
 			unitW += w.width
 		}
 		gap := words[i].gap
-		if len(cur) == 0 && !hardStart {
+		if len(cur) == 0 && !b.hardStart {
 			gap = 0 // drop leading whitespace at a soft-wrap continuation line
 		}
 		var leader string
-		lineStart := p.Props.Indent.LeftPt // where the line begins, from the column's left edge
-		if len(lines) == 0 {
-			lineStart += p.Props.Indent.FirstLineOffsetPt
+		lineStart := b.props.Indent.LeftPt // where the line begins, from the column's left edge
+		if !b.started {
+			lineStart += b.props.Indent.FirstLineOffsetPt
 		}
 		if words[i].tab {
-			unitW, leader = tabAdvance(p.Props, lineStart+curW+gap, segmentWidth(words[end:]))
+			after, toDecimal := segmentWidths(b.r, words[end:])
+			unitW, leader = tabAdvance(b.props, lineStart+curW+gap, after, toDecimal)
 		}
 		if len(cur) > 0 && curW+gap+unitW > width {
-			flush()
-			gap = 0 // this word now opens a soft-wrap line
-			if words[i].tab {
-				unitW, leader = tabAdvance(p.Props, p.Props.Indent.LeftPt, segmentWidth(words[end:]))
-			}
+			return flush(), true // this word opens the next, soft-wrap line
 		}
 		for k, w := range words[i:end] {
 			if k == 0 {
@@ -178,60 +216,88 @@ func layoutParagraph(r renderer, p Paragraph, width float64) []line {
 			curMax = math.Max(curMax, w.props.SizePt)
 			curImg = math.Max(curImg, w.height())
 		}
-		hardStart = false
-		i = end
+		b.hardStart = false
+		b.i = end
 	}
 	if len(cur) > 0 {
-		flush()
+		return flush(), true
 	}
-	if pending != breakNone {
+	if b.pending != breakNone {
 		// A break ending the paragraph leaves its paragraph mark on the next
 		// page, as Word draws it: an empty line there.
-		blankLine()
+		return blankLine(), true
 	}
-	return lines
+	return line{}, false
 }
 
 // tabAdvance is how far a tab at x (measured from the text column's left edge)
 // advances: to the nearest stop past x - a custom one, or the implicit stop a
-// hanging indent puts at the left indent - less the text after it for a right
-// or centered stop; with neither, to the next stop of the default half-inch
-// grid. It also returns the leader the stop fills the span with.
-func tabAdvance(pp ParagraphProperties, x, after float64) (float64, string) {
+// hanging indent puts at the left indent - less the text after it (after) for
+// a right or centered stop, or the text up to its decimal separator
+// (toDecimal) for a decimal one; with neither, to the next stop of the
+// document's default tab grid. Bar stops are skipped: they only draw a rule.
+// It also returns the leader the stop fills the span with.
+func tabAdvance(pp ParagraphProperties, x, after, toDecimal float64) (float64, string) {
 	const eps = 0.01 // a stop the pen is already on does not count
 	next := TabStop{PosPt: math.Inf(1)}
-	if i := slices.IndexFunc(pp.Tabs, func(s TabStop) bool { return s.PosPt > x+eps }); i >= 0 {
+	if i := slices.IndexFunc(pp.Tabs, func(s TabStop) bool { return s.Align != TabBar && s.PosPt > x+eps }); i >= 0 {
 		next = pp.Tabs[i]
 	}
 	if ind := pp.Indent; ind.FirstLineOffsetPt < 0 && ind.LeftPt > x+eps && ind.LeftPt < next.PosPt {
 		next = TabStop{PosPt: ind.LeftPt}
 	}
 	if math.IsInf(next.PosPt, 1) {
-		next = TabStop{PosPt: (math.Floor((x+eps)/defaultTabStopPt) + 1) * defaultTabStopPt}
+		step := cmp.Or(pp.DefaultTabStopPt, defaultTabStopPt)
+		next = TabStop{PosPt: (math.Floor((x+eps)/step) + 1) * step}
 	}
 	adv := next.PosPt - x
 	switch next.Align {
-	case TabRight, TabDecimal:
+	case TabRight:
 		adv -= after
+	case TabDecimal:
+		adv -= toDecimal
 	case TabCenter:
 		adv -= after / 2
-	case TabLeft:
+	case TabLeft, TabBar:
 	}
 	return math.Max(adv, 0), next.Leader
 }
 
-// segmentWidth is the width of the words up to the next tab or break: the text
-// a right or centered tab stop aligns.
-func segmentWidth(words []word) float64 {
-	var w float64
+// segmentWidths measures the words up to the next tab or break - the text a
+// right or centered tab stop aligns - and the part of it before its decimal
+// separator, which a decimal stop aligns. With no separator the two are equal,
+// so a decimal stop then ends the text at the stop like a right one.
+func segmentWidths(r renderer, words []word) (whole, toDecimal float64) {
+	toDecimal = -1
 	for _, x := range words {
 		if x.tab || x.lineBreak {
 			break
 		}
-		w += x.gap + x.width
+		if i := decimalSeparator(x.text); toDecimal < 0 && x.img == nil && i >= 0 {
+			r.SetFont(x.props.FontFamily, x.props.Bold, x.props.Italic, x.props.Underline, x.props.SizePt)
+			toDecimal = whole + x.gap + r.TextWidth(x.text[:i])
+		}
+		whole += x.gap + x.width
 	}
-	return w
+	if toDecimal < 0 {
+		toDecimal = whole
+	}
+	return whole, toDecimal
 }
+
+// decimalSeparator is the byte index of s's decimal separator: its last "." or
+// "," with a digit on each side (so "1,234.50" aligns on the point and the
+// Ukrainian "1 234,50" on the comma), or -1 when it has none.
+func decimalSeparator(s string) int {
+	for i := len(s) - 2; i > 0; i-- {
+		if (s[i] == '.' || s[i] == ',') && isDigit(s[i-1]) && isDigit(s[i+1]) {
+			return i
+		}
+	}
+	return -1
+}
+
+func isDigit(b byte) bool { return b >= '0' && b <= '9' }
 
 // drawLine renders one packed line at baseline y, positioned within [x0, x0+width]
 // per the paragraph's alignment. isLast suppresses justification of a
@@ -257,7 +323,7 @@ func drawLine(r renderer, ln line, align Alignment, x0, width, y float64, isLast
 		x = x0 + (width-(ln.natural-lead))/2
 	case AlignJustify:
 		if !isLast {
-			if gaps := gapCount(ln); gaps > 0 {
+			if gaps := len(stretchable(ln)); gaps > 0 {
 				if slack := width - ln.natural; slack > 0 {
 					extraPerGap = slack / float64(gaps)
 				}
@@ -286,10 +352,11 @@ func drawLine(r renderer, ln line, align Alignment, x0, width, y float64, isLast
 	// the picture overflow the line box upward.
 	baseline := y + math.Max(ln.maxSize, ln.maxImg)
 	placed := make([]float64, len(ln.words)) // each word's x, so shading can be drawn under it
+	stretch := stretchable(ln)
 	for i, w := range ln.words {
 		if i > 0 {
 			x += w.gap
-			if extraPerGap > 0 && w.gap > 0 {
+			if extraPerGap > 0 && slices.Contains(stretch, i) {
 				x += extraPerGap
 			}
 		}
@@ -314,7 +381,7 @@ func drawLine(r renderer, ln line, align Alignment, x0, width, y float64, isLast
 	}
 	for i, w := range ln.words {
 		if w.img != nil {
-			r.DrawImage(placed[i], baseline-w.img.HeightPt, w.img.WidthPt, w.img.HeightPt, w.img)
+			drawPicture(r, w.img, placed[i], baseline-w.img.HeightPt)
 			continue
 		}
 		if w.tab {
@@ -323,7 +390,61 @@ func drawLine(r renderer, ln line, align Alignment, x0, width, y float64, isLast
 		}
 		r.SetFont(w.props.FontFamily, w.props.Bold, w.props.Italic, w.props.Underline, w.props.SizePt)
 		r.SetTextColor(w.props.Color)
-		r.DrawText(placed[i], baseline, w.text)
+		r.DrawText(placed[i], baseline-w.props.BaselineShiftPt, w.text)
+	}
+	drawLinks(r, ln, placed, y, baseline)
+}
+
+// drawLinks makes each stretch of consecutive words sharing a hyperlink one
+// clickable rectangle - the gaps between them included - as high as the line
+// box at y, and at least as tall as the stretch's text above its baseline.
+func drawLinks(r renderer, ln line, placed []float64, y, baseline float64) {
+	for i := 0; i < len(ln.words); {
+		link := ln.words[i].link
+		j := i + 1
+		for j < len(ln.words) && ln.words[j].link == link {
+			j++
+		}
+		if link != "" {
+			top := y
+			for _, w := range ln.words[i:j] {
+				top = math.Min(top, baseline-math.Max(w.props.SizePt, w.height()))
+			}
+			r.Link(placed[i], top, placed[j-1]+ln.words[j-1].width-placed[i], baseline+ln.maxSize*(lineSpacing-1)-top, link)
+		}
+		i = j
+	}
+}
+
+// drawPicture draws img at its drawn size with its top-left corner at (x, y):
+// a cropped picture is drawn whole at the size that makes its visible part
+// that big, clipped to that part.
+func drawPicture(r renderer, img *Image, x, y float64) {
+	c := img.Crop
+	if c == (Crop{}) {
+		r.DrawImage(x, y, img.WidthPt, img.HeightPt, img)
+		return
+	}
+	visW, visH := 1-c.Left-c.Right, 1-c.Top-c.Bottom
+	if visW <= 0.001 || visH <= 0.001 {
+		return // cropped away entirely
+	}
+	w, h := img.WidthPt/visW, img.HeightPt/visH
+	r.Clip(x, y, img.WidthPt, img.HeightPt)
+	r.DrawImage(x-c.Left*w, y-c.Top*h, w, h, img)
+	r.ClipEnd()
+}
+
+// barTabWidthPt is the thickness of a bar tab's rule: a hairline, as Word draws.
+const barTabWidthPt = 0.5
+
+// drawBarTabs draws the rule of each bar tab among tabs down a line box at y of
+// height h; tab positions are measured from the text column's left edge colX.
+func drawBarTabs(r renderer, tabs []TabStop, colX, y, h float64) {
+	for _, t := range tabs {
+		if t.Align == TabBar {
+			r.StrokeLine(colX+t.PosPt, y, colX+t.PosPt, y+h, barTabWidthPt, "#000000")
+		}
 	}
 }
 
@@ -344,14 +465,23 @@ func drawLeader(r renderer, w word, x, baseline float64) {
 	}
 }
 
-func gapCount(ln line) int {
-	n := 0
+// stretchable lists the words whose leading gap justification widens: those
+// after the line's last tab, since Word lays out the text before a tab against
+// its stop and only stretches what follows it.
+func stretchable(ln line) []int {
+	from := 1
 	for i, w := range ln.words {
-		if i > 0 && w.gap > 0 {
-			n++
+		if w.tab {
+			from = i + 1
 		}
 	}
-	return n
+	var out []int
+	for i := from; i < len(ln.words); i++ {
+		if ln.words[i].gap > 0 {
+			out = append(out, i)
+		}
+	}
+	return out
 }
 
 // measureWords tokenizes a paragraph's runs into words, each carrying the
@@ -376,7 +506,7 @@ func measureWords(r renderer, p Paragraph) []word {
 			pendingGap = 0
 			continue
 		case run.Tab:
-			words = append(words, word{tab: true, props: run.Props, gap: pendingGap})
+			words = append(words, word{tab: true, props: run.Props, gap: pendingGap, link: run.Link})
 			pendingGap = 0
 			continue
 		case run.Image != nil:
@@ -385,6 +515,7 @@ func measureWords(r renderer, p Paragraph) []word {
 				props: run.Props,
 				width: math.Max(run.Image.WidthPt, run.MinWidthPt),
 				gap:   pendingGap,
+				link:  run.Link,
 			})
 			pendingGap = 0
 			continue
@@ -395,9 +526,10 @@ func measureWords(r renderer, p Paragraph) []word {
 				pendingGap += r.TextWidth(tok.text)
 				continue
 			}
-			w := word{text: tok.text, props: run.Props, width: r.TextWidth(tok.text), gap: pendingGap, field: run.Field}
+			w := word{text: tok.text, props: run.Props, width: r.TextWidth(tok.text), gap: pendingGap, field: run.Field, link: run.Link}
 			if i == 0 { // the run's advance floor applies to its first token (a list marker is one)
 				w.width = math.Max(w.width, run.MinWidthPt)
+				w.note = run.Note
 			}
 			words = append(words, w)
 			pendingGap = 0

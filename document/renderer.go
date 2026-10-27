@@ -72,6 +72,11 @@ type renderer interface {
 	Clip(x, y, w, h float64)
 	// ClipEnd undoes the last Clip.
 	ClipEnd()
+	// Link makes the rectangle a clickable link to target: an external URL, or
+	// "#name" for the place Anchor marked with that name (see Run.Link).
+	Link(x, y, w, h float64, target string)
+	// Anchor marks y on the current page as the destination of "#name" links.
+	Anchor(name string, y float64)
 	// Output writes the finished PDF, returning any accumulated backend error.
 	Output(w io.Writer) error
 }

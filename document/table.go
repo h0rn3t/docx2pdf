@@ -7,11 +7,13 @@ import "math"
 // after its row's cells are measured, so they're carried from layout time to
 // then).
 type paraBox struct {
-	lines   []line
-	align   Alignment
-	indent  Indent
-	spacing Spacing
-	shading string
+	lines     []line
+	align     Alignment
+	indent    Indent
+	spacing   Spacing
+	shading   string
+	tabs      []TabStop
+	bookmarks []string
 }
 
 // cellContent is a cell's laid-out paragraphs and nested tables in document
@@ -225,11 +227,13 @@ func layoutCellContent(r renderer, cell Cell, m CellMargins, width, wrapLen, ava
 		innerWidth := inner - p.Props.Indent.LeftPt - p.Props.Indent.RightPt
 		lines := layoutParagraph(r, p, innerWidth)
 		cc.items = append(cc.items, cellItem{para: &paraBox{
-			lines:   lines,
-			align:   p.Props.Alignment,
-			indent:  p.Props.Indent,
-			spacing: p.Props.Spacing,
-			shading: p.Props.Shading,
+			lines:     lines,
+			align:     p.Props.Alignment,
+			indent:    p.Props.Indent,
+			spacing:   p.Props.Spacing,
+			shading:   p.Props.Shading,
+			tabs:      p.Props.Tabs,
+			bookmarks: p.Bookmarks,
 		}})
 		if len(lines) == 0 {
 			cc.height += lineHeightFor(defaultRenderSizePt, 0, p.Props.Spacing)
@@ -533,13 +537,23 @@ func spanWidth(colWidths []float64, col, span int) float64 {
 func renderTable(f *flow, t Table) {
 	fr := f.frame()
 	tl := layoutTable(f.r, t, fr.contentWidth, fr.bottomLimit-fr.originY)
-	if t.Float != nil {
-		x, y := floatOrigin(f, *t.Float, tl)
+	// A floating table taller than a whole frame cannot be placed anywhere, so
+	// it flows - and paginates - like any other.
+	if t.Float != nil && tl.totalHeight <= f.frame().bottomLimit-f.top {
+		x, y := floatOrigin(f, *t.Float, tl.width(), tl.totalHeight)
+		if t.Float.VertAnchor == AnchorText && y+tl.totalHeight > f.frame().bottomLimit && !f.atTop {
+			// Word moves a floating table that does not fit on to the next page
+			// whole rather than splitting it.
+			f.breakFrame()
+			x, y = floatOrigin(f, *t.Float, tl.width(), tl.totalHeight)
+		}
 		drawTableRows(f.r, tl, x, y)
+		f.addFloat(*t.Float, x, y, tl.width(), tl.totalHeight)
 		return
 	}
 	frameStart := -1 // the first row drawn on a frame the table broke onto
 	drawn := make(map[[2]int]float64)
+	vertical := make(map[[2]int]*verticalCut)
 	nextFrame := func(ri int) {
 		f.breakFrame()
 		if ri >= tl.headerRows { // the header rows themselves are not repeated above themselves
@@ -549,7 +563,8 @@ func renderTable(f *flow, t Table) {
 	}
 	for ri := 0; ri < len(tl.rows); {
 		end := tl.blockEnd(ri)
-		room := f.frame().bottomLimit - pageFrom(f.sec.sec.Geometry).originY
+		f.skipFloats(f.frame().originX, f.frame().originX+tl.width(), tl.rowsHeight(ri, end))
+		room := f.frame().bottomLimit - f.top
 		if ri >= tl.headerRows {
 			room -= tl.rowsHeight(0, min(tl.headerRows, len(tl.rows)))
 		}
@@ -558,25 +573,50 @@ func renderTable(f *flow, t Table) {
 		}
 		for ; ri < end; ri++ {
 			rh := tl.rows[ri].height
-			if ri != frameStart && f.y+rh > f.frame().bottomLimit && !f.atTop {
+			notes := rowNotes(tl.rows[ri])
+			if ri != frameStart && (f.y+rh > f.frame().bottomLimit || !f.notesFit(notes, rh)) && !f.atTop {
 				nextFrame(ri)
 			}
-			drawRow(f.r, tl, ri, f.frame().originX, f.y, &pageCut{bottom: f.frame().bottomLimit, frameStart: ri == frameStart, drawn: drawn})
+			drawRow(f.r, tl, ri, f.frame().originX, f.y, &pageCut{bottom: f.frame().bottomLimit, frameStart: ri == frameStart, drawn: drawn, vertical: vertical})
 			f.y += rh
 			f.atTop = false
+			f.addNotes(notes)
 		}
 	}
 }
 
-// floatOrigin places a floating table: each axis is measured from its anchor -
-// the text column, the page's margin, or the page's edge - either by the offset
-// the table declares (w:tblpX/w:tblpY) or, when it names an alignment instead
-// (w:tblpXSpec/w:tblpYSpec), by aligning it against that anchor.
-//
-// ponytail: the surrounding text does not wrap around a floating table, so body
-// text can run underneath it; wrapping needs the layout to know about exclusion
-// zones.
-func floatOrigin(f *flow, fl TableFloat, tl tableLayout) (float64, float64) {
+// rowNotes lists the footnotes the row's cells reference, nested tables
+// included.
+func rowNotes(row rowLayout) []*Note {
+	var notes []*Note
+	for _, cl := range row.cells {
+		notes = append(notes, contentNotes(cl.content)...)
+	}
+	return notes
+}
+
+func contentNotes(c cellContent) []*Note {
+	var notes []*Note
+	for _, it := range c.items {
+		switch {
+		case it.table != nil:
+			for _, row := range it.table.rows {
+				notes = append(notes, rowNotes(row)...)
+			}
+		default:
+			for _, ln := range it.para.lines {
+				notes = append(notes, lineNotes(ln.words)...)
+			}
+		}
+	}
+	return notes
+}
+
+// floatOrigin places a floating object w × h - a table or a picture: each axis
+// is measured from its anchor - the text column (vertically, the cursor), the
+// page's margin, or the page's edge - either by the offset the object declares
+// or, when it names an alignment instead, by aligning it against that anchor.
+func floatOrigin(f *flow, fl Float, w, h float64) (float64, float64) {
 	g := f.sec.sec.Geometry
 	fr := f.frame()
 
@@ -589,9 +629,9 @@ func floatOrigin(f *flow, fl TableFloat, tl tableLayout) (float64, float64) {
 	}
 	switch fl.XSpec {
 	case "center":
-		x += (availW - tl.width()) / 2
+		x += (availW - w) / 2
 	case "right", "outside":
-		x += availW - tl.width()
+		x += availW - w
 	case "left", "inside":
 	default:
 		x += fl.XPt
@@ -606,9 +646,9 @@ func floatOrigin(f *flow, fl TableFloat, tl tableLayout) (float64, float64) {
 	}
 	switch fl.YSpec {
 	case "center":
-		y += (availH - tl.totalHeight) / 2
+		y += (availH - h) / 2
 	case "bottom", "outside":
-		y += availH - tl.totalHeight
+		y += availH - h
 	case "top", "inside":
 	default:
 		y += fl.YPt
@@ -634,22 +674,77 @@ type pageCut struct {
 	bottom     float64
 	frameStart bool
 	drawn      map[[2]int]float64
+	// vertical is, per vertical-text merge cut across frames, where its text
+	// has got to.
+	vertical map[[2]int]*verticalCut
 }
 
-// window picks the part of cl's content a box of the given height draws on this
-// frame: from where the previous frame stopped, to the last whole line that fits
-// when the cell is cut again here (more), else to the end. It records where it
-// stopped. Vertical text is not split: it is drawn (clipped) on the first frame
-// only.
+// verticalCut is how far the text of a vertical cell cut across frames has
+// been drawn: the paragraph it is in, and the line breaker positioned in it.
+// Its lines run along the row's height, so each frame's part is packed again at
+// the length that frame gives it.
+type verticalCut struct {
+	paras   []Paragraph
+	pi      int
+	b       lineBreaker
+	started bool // b is positioned in paras[pi]
+}
+
+// part packs the next lines of the cell's text at the given length, as many as
+// fit across room - always at least one, so the text moves on.
+func (v *verticalCut) part(r renderer, length, room float64) cellContent {
+	var cc cellContent
+	var box *paraBox
+	for v.pi < len(v.paras) {
+		p := v.paras[v.pi]
+		if !v.started {
+			v.b, v.started, box = newLineBreaker(r, p), true, nil
+		}
+		if v.b.done() {
+			v.pi, v.started = v.pi+1, false
+			continue
+		}
+		retry := v.b
+		ln, _ := v.b.next(length - p.Props.Indent.LeftPt - p.Props.Indent.RightPt)
+		if cc.height > 0 && cc.height+ln.height > room {
+			v.b = retry
+			break
+		}
+		if box == nil {
+			box = &paraBox{align: p.Props.Alignment, indent: p.Props.Indent, spacing: p.Props.Spacing, shading: p.Props.Shading, tabs: p.Props.Tabs}
+			cc.items = append(cc.items, cellItem{para: box})
+		}
+		box.lines = append(box.lines, ln)
+		cc.height += ln.height
+	}
+	return cc
+}
+
+// drawVertical draws a vertical cell's part on this frame: its text packed
+// again for the box's height and picked up where the previous frame stopped.
+func (c *pageCut) drawVertical(r renderer, cl cellLayout, key [2]int, x, y, width, height float64) {
+	v := c.vertical[key]
+	if v == nil {
+		v = &verticalCut{}
+		for _, el := range cl.cell.blocks() {
+			if el.Paragraph != nil {
+				v.paras = append(v.paras, *el.Paragraph)
+			}
+		}
+		c.vertical[key] = v
+	}
+	m := cl.margins
+	part := cl
+	part.content = v.part(r, height-m.LeftPt-m.RightPt, width-m.TopPt-m.BottomPt)
+	drawCellBox(r, part, x, y, width, height, true, wholeContent)
+}
+
+// window picks the part of cl's (horizontal) content a box of the given height
+// draws on this frame: from where the previous frame stopped, to the last whole
+// line that fits when the cell is cut again here (more), else to the end. It
+// records where it stopped. Vertical text is cut by drawVertical instead.
 func (c *pageCut) window(cl cellLayout, key [2]int, height float64, more bool) contentWindow {
 	from := c.drawn[key]
-	if cl.cell.TextDirection != TextDirectionHorizontal {
-		c.drawn[key] = math.Inf(1)
-		if from > 0 {
-			return contentWindow{from: math.Inf(1), to: math.Inf(1)}
-		}
-		return wholeContent
-	}
 	to := math.Inf(1)
 	if more {
 		to = cl.content.breakAt(from, from+height-cl.margins.TopPt-cl.margins.BottomPt)
@@ -679,14 +774,23 @@ func drawRow(r renderer, tl tableLayout, ri int, x0, y float64, cut *pageCut) {
 			rc, _ := tl.rows[start].cellAt(cl.col)
 			rest := tl.mergedHeight(start, cl.col) - tl.rowsHeight(start, ri)
 			height := min(rest, cut.bottom-y)
+			width := spanWidth(tl.colWidths, cl.col, colSpan(rc.cell))
+			if rc.cell.TextDirection != TextDirectionHorizontal {
+				cut.drawVertical(r, rc, [2]int{start, cl.col}, x, y, width, height)
+				continue
+			}
 			win := cut.window(rc, [2]int{start, cl.col}, height, rest > height)
-			drawCellBox(r, rc, x, y, spanWidth(tl.colWidths, cl.col, colSpan(rc.cell)), height, true, win)
+			drawCellBox(r, rc, x, y, width, height, true, win)
 			continue
 		}
 		width := spanWidth(tl.colWidths, cl.col, colSpan(cl.cell))
 		height, clip, win := tl.mergedHeight(ri, cl.col), row.fixed, wholeContent
 		if cut != nil && y+height > cut.bottom {
 			height, clip = cut.bottom-y, true
+			if cl.cell.TextDirection != TextDirectionHorizontal {
+				cut.drawVertical(r, cl, [2]int{ri, cl.col}, x, y, width, height)
+				continue
+			}
 			win = cut.window(cl, [2]int{ri, cl.col}, height, true)
 		}
 		drawCellBox(r, cl, x, y, width, height, clip, win)
@@ -821,6 +925,12 @@ func drawCellContent(r renderer, cl cellLayout, x, y, width, height float64, win
 			if visible(pos, pos+ln.height) {
 				if pb.shading != "" { // paragraph shading sits over the cell's, under the text
 					r.FillRect(innerX, top+pos, innerWidth, ln.height, pb.shading)
+				}
+				drawBarTabs(r, pb.tabs, x+m.LeftPt, top+pos, ln.height)
+				if i == 0 {
+					for _, name := range pb.bookmarks {
+						r.Anchor(name, top+pos)
+					}
 				}
 				drawLine(r, ln, pb.align, innerX, innerWidth, top+pos, i == len(pb.lines)-1, pb.indent.FirstLineOffsetPt, i == 0)
 			}
