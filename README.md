@@ -4,7 +4,7 @@
 LibreOffice чи headless-браузера.
 
 ```sh
-go get github.com/h0rn3t/docx2pdf@v0.0.7
+go get github.com/h0rn3t/docx2pdf@v0.0.8
 ```
 
 ## Використання
