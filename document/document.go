@@ -11,7 +11,10 @@ package document
 import (
 	"archive/zip"
 	"encoding/xml"
+	"errors"
 	"fmt"
+	"io/fs"
+	pathpkg "path"
 	"sync"
 )
 
@@ -86,6 +89,15 @@ type Run struct {
 	// page count. Text holds the value cached in the .docx, used as-is until the
 	// renderer overwrites it. "" for an ordinary run.
 	Field string
+	// PageBreak and ColumnBreak mark an explicit <w:br w:type="page"/> or
+	// "column" that follows content in its paragraph: what comes after it goes
+	// to the next page (column). Like LineBreak, such a run carries no text. A
+	// break before any content is reported on ParagraphProperties instead.
+	PageBreak, ColumnBreak bool
+	// Tab marks a <w:tab/>: the run carries no text and advances to the
+	// paragraph's next tab stop (ParagraphProperties.Tabs, then the default
+	// half-inch grid).
+	Tab bool
 }
 
 // Field kinds a Run may carry (see Run.Field). Only page-number fields are
@@ -99,11 +111,13 @@ const (
 type ParagraphProperties struct {
 	Alignment Alignment
 	// PageBreak reports whether an explicit page break precedes this paragraph
-	// (a <w:br w:type="page"/> in one of its runs or <w:pageBreakBefore/>).
+	// (<w:pageBreakBefore/>, or a <w:br w:type="page"/> before any of its
+	// content; a break after content is a Run with PageBreak set).
 	PageBreak bool
 	// ColumnBreak reports an explicit column break (<w:br w:type="column"/>)
 	// preceding this paragraph: in a multi-column section it moves to the next
-	// column, and on the last column to the next page.
+	// column, and on the last column to the next page. As with PageBreak, a
+	// break after content is a Run instead.
 	ColumnBreak bool
 	// Indent is the paragraph's left/right/first-line indentation (from
 	// w:ind), in points. The zero value is no indent.
@@ -115,6 +129,35 @@ type ParagraphProperties struct {
 	// "" when it has none. It is painted across the paragraph's indented text
 	// area, behind its lines.
 	Shading string
+	// Tabs are the paragraph's custom tab stops (w:tabs, merged down its style
+	// chain), sorted by position.
+	Tabs []TabStop
+}
+
+// TabAlign is how text aligns against a tab stop (w:tab/@w:val).
+type TabAlign int
+
+const (
+	// TabLeft starts the text after the tab at the stop.
+	TabLeft TabAlign = iota
+	// TabCenter centers it on the stop.
+	TabCenter
+	// TabRight ends it at the stop.
+	TabRight
+	// TabDecimal aligns its decimal point on the stop; it is laid out as
+	// TabRight, which matches it for text with no fractional part.
+	TabDecimal
+)
+
+// TabStop is one custom tab stop.
+type TabStop struct {
+	// PosPt is the stop's position from the text column's left edge (the page
+	// or cell margin, not the paragraph's indent), in points.
+	PosPt float64
+	Align TabAlign
+	// Leader is the character that fills the tab's span ("." for a table of
+	// contents' dot leader), or "" for none.
+	Leader string
 }
 
 // Indent is a paragraph's indentation in points, from w:ind.
@@ -335,10 +378,14 @@ const (
 	VAlignBottom
 )
 
-// Cell is one table cell: its paragraphs, horizontal/vertical merge state,
-// resolved borders, shading, margins, text direction and vertical alignment,
-// and an optional nested table.
+// Cell is one table cell: its content, horizontal/vertical merge state,
+// resolved borders, shading, margins, text direction and vertical alignment.
 type Cell struct {
+	// Content is the cell's paragraphs and nested tables in document order.
+	// When it is empty the layout falls back to Paragraphs followed by Nested,
+	// so a Cell built by hand from those two still renders.
+	Content []BodyElement
+	// Paragraphs is every paragraph of Content, without the tables.
 	Paragraphs []Paragraph
 	// ColSpan is the number of grid columns this cell spans (from
 	// w:gridSpan); 1 when absent.
@@ -355,7 +402,7 @@ type Cell struct {
 	TextDirection TextDirection
 	// VAlign is where the content sits within the cell's height (w:vAlign).
 	VAlign VerticalAlign
-	// Nested is the first table found directly inside this cell, or nil.
+	// Nested is the first table in Content, or nil.
 	Nested *Table
 }
 
@@ -386,9 +433,10 @@ type Document struct {
 	closed bool
 }
 
-// Open opens a .docx file, reads its word/document.xml main part, and returns
-// an in-memory Document. It returns a nil Document and a non-nil error when the
-// file does not exist, is not a valid ZIP archive, or lacks word/document.xml.
+// Open opens a .docx file, reads its main document part (the package's
+// officeDocument relationship, normally word/document.xml), and returns an
+// in-memory Document. It returns a nil Document and a non-nil error when the
+// file does not exist, is not a valid ZIP archive, or lacks the main part.
 func Open(path string) (*Document, error) {
 	r, err := zip.OpenReader(path)
 	if err != nil {
@@ -397,18 +445,27 @@ func Open(path string) (*Document, error) {
 	defer func() { _ = r.Close() }()
 
 	p := newPkg(r.File)
-	main, ok := p.part("word/document.xml")
-	if !ok {
-		return nil, fmt.Errorf("docx2pdf: %q is not a valid docx: missing word/document.xml", path)
+	mainName := p.relatedPart("", "officeDocument", "word/document.xml")
+	main, err := p.part(mainName)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("docx2pdf: %q is not a valid docx: missing %s", path, mainName)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("docx2pdf: read %q: %w", path, err)
 	}
 	var xdoc xmlDocument
 	if err := xml.Unmarshal(main, &xdoc); err != nil {
-		return nil, fmt.Errorf("docx2pdf: parse word/document.xml in %q: %w", path, err)
+		return nil, fmt.Errorf("docx2pdf: parse %s in %q: %w", mainName, path, err)
 	}
 
-	xs := optionalPart[xmlStyles](p, "word/styles.xml")
-	theme := optionalPart[xmlTheme](p, "word/theme/theme1.xml")
-	numbering := optionalPart[xmlNumbering](p, "word/numbering.xml")
+	// The supporting parts are found through the main part's relationships;
+	// the conventional names are the fallback for a package that omits them.
+	dir := pathpkg.Dir(mainName)
+	xs := optionalPart[xmlStyles](p, p.relatedPart(mainName, "styles", pathpkg.Join(dir, "styles.xml")))
+	theme := optionalPart[xmlTheme](p, p.relatedPart(mainName, "theme", pathpkg.Join(dir, "theme/theme1.xml")))
+	numberingName := p.relatedPart(mainName, "numbering", pathpkg.Join(dir, "numbering.xml"))
+	numbering := optionalPart[xmlNumbering](p, numberingName)
+	settings := optionalPart[xmlSettings](p, p.relatedPart(mainName, "settings", pathpkg.Join(dir, "settings.xml")))
 
 	sc := styleContext{
 		tables:     buildTableStyles(xs),
@@ -416,10 +473,10 @@ func Open(path string) (*Document, error) {
 		chars:      buildCharStyles(xs),
 		theme:      buildThemeMap(theme),
 		themeFonts: buildThemeFontMap(theme),
-		images:     p.resolverFor("word/document.xml"),
+		images:     p.resolverFor(mainName),
 		// A picture bullet's media is referenced from the numbering part, so it
 		// resolves through that part's own relationships.
-		numbering: newNumberingState(buildNumbering(numbering, p.resolverFor("word/numbering.xml"))),
+		numbering: newNumberingState(buildNumbering(numbering, p.resolverFor(numberingName))),
 	}
 	if xs != nil && xs.DocDefaults != nil {
 		if xs.DocDefaults.PPrDefault != nil {
@@ -431,7 +488,8 @@ func Open(path string) (*Document, error) {
 	}
 
 	body, breaks := buildBody(xdoc.Body, sc)
-	sections := buildSections(breaks, xdoc.Body.SectPr, len(body), p, sc)
+	evenAndOdd := settings != nil && settings.EvenAndOddHeaders.on()
+	sections := buildSections(breaks, xdoc.Body.SectPr, len(body), evenAndOdd, p, sc)
 	return &Document{
 		Body:     body,
 		Geometry: sections[0].Geometry,
@@ -444,8 +502,8 @@ func Open(path string) (*Document, error) {
 // nil - the corresponding formatting tier is then simply skipped - rather than
 // failing Open, since only word/document.xml is a required part.
 func optionalPart[T any](p *pkg, name string) *T {
-	data, ok := p.part(name)
-	if !ok {
+	data, err := p.part(name)
+	if err != nil {
 		return nil
 	}
 	var v T

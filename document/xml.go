@@ -1,9 +1,13 @@
 package document
 
 import (
+	"cmp"
 	"encoding/xml"
+	"errors"
 	"io"
+	"maps"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -36,17 +40,40 @@ type xmlBodyChild struct {
 }
 
 func (b *xmlBody) UnmarshalXML(d *xml.Decoder, _ xml.StartElement) error {
+	return decodeBlocks(d, &b.Children, func(start xml.StartElement) (bool, error) {
+		if start.Name.Local != "sectPr" {
+			return false, nil
+		}
+		var s xmlSectPr
+		if err := d.DecodeElement(&s, &start); err != nil {
+			return true, err
+		}
+		b.SectPr = &s
+		return true, nil
+	})
+}
+
+// decodeBlocks reads the block-level children (w:p, w:tbl) of the element d is
+// positioned in, in document order, up to its end tag. Content controls and
+// custom XML (w:sdt, w:customXml) are transparent: the blocks inside them are
+// read as if they were direct children, since that is where Word puts a table of
+// contents or a cover page. other is offered every remaining WordprocessingML
+// element and reports whether it consumed it; what it declines is skipped.
+func decodeBlocks(d *xml.Decoder, out *[]xmlBodyChild, other func(xml.StartElement) (bool, error)) error {
 	for {
 		tok, err := d.Token()
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			return err
 		}
 		start, ok := tok.(xml.StartElement)
 		if !ok {
-			continue // EndElement of <w:body> itself, or CharData/Comment
+			if _, end := tok.(xml.EndElement); end {
+				return nil // children were consumed by DecodeElement/Skip
+			}
+			continue
 		}
 		if start.Name.Space != wordNS {
 			if err := d.Skip(); err != nil {
@@ -60,26 +87,34 @@ func (b *xmlBody) UnmarshalXML(d *xml.Decoder, _ xml.StartElement) error {
 			if err := d.DecodeElement(&p, &start); err != nil {
 				return err
 			}
-			b.Children = append(b.Children, xmlBodyChild{Paragraph: &p})
+			*out = append(*out, xmlBodyChild{Paragraph: &p})
 		case "tbl":
 			var t xmlTable
 			if err := d.DecodeElement(&t, &start); err != nil {
 				return err
 			}
-			b.Children = append(b.Children, xmlBodyChild{Table: &t})
-		case "sectPr":
-			var s xmlSectPr
-			if err := d.DecodeElement(&s, &start); err != nil {
+			*out = append(*out, xmlBodyChild{Table: &t})
+		case "sdt", "sdtContent", "customXml":
+			if err := decodeBlocks(d, out, skipAll); err != nil {
 				return err
 			}
-			b.SectPr = &s
 		default:
-			if err := d.Skip(); err != nil {
+			handled, err := other(start)
+			if err != nil {
 				return err
+			}
+			if !handled {
+				if err := d.Skip(); err != nil {
+					return err
+				}
 			}
 		}
 	}
 }
+
+// skipAll declines every element, for decodeBlocks inside a wrapper whose own
+// properties (w:sdtPr, w:customXmlPr) are not modeled.
+func skipAll(xml.StartElement) (bool, error) { return false, nil }
 
 // xmlSectPr is a <w:sectPr>: page size (w:pgSz), margins (w:pgMar), column
 // layout (w:cols), break type (w:type), and the header/footer parts the section
@@ -133,7 +168,7 @@ func (xp *xmlParagraph) UnmarshalXML(d *xml.Decoder, _ xml.StartElement) error {
 	for {
 		tok, err := d.Token()
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			return err
@@ -176,6 +211,14 @@ func (xp *xmlParagraph) UnmarshalXML(d *xml.Decoder, _ xml.StartElement) error {
 				return err
 			}
 			xp.Items = append(xp.Items, xmlParaChild{FldSimple: &fs})
+		case "ins", "moveTo", "smartTag", "customXml", "sdt", "sdtContent":
+			// Wrappers around ordinary runs - a tracked insertion (shown as
+			// accepted), a smart tag, a content control: their runs belong to
+			// the paragraph in place. w:del and w:moveFrom (removed text) are
+			// skipped by the default case.
+			if err := xp.UnmarshalXML(d, start); err != nil {
+				return err
+			}
 		default:
 			if err := d.Skip(); err != nil {
 				return err
@@ -192,8 +235,85 @@ type xmlPPr struct {
 	Spacing         *xmlPSpacing `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main spacing"`
 	NumPr           *xmlNumPr    `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main numPr"`
 	Shd             *xmlShd      `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main shd"`
+	Tabs            *xmlTabs     `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main tabs"`
 	// SectPr is only meaningful on a body paragraph: it ends a section there.
 	SectPr *xmlSectPr `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main sectPr"`
+}
+
+// xmlTabs is <w:tabs>: the paragraph's custom tab stops. A w:tab of
+// w:val="clear" removes a stop the paragraph would inherit from its style.
+type xmlTabs struct {
+	Tabs []xmlTab `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main tab"`
+}
+
+// xmlTab is one <w:tab> stop: its alignment, leader and position (dxa, from
+// the text column's left edge).
+type xmlTab struct {
+	Val    string `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main val,attr"`
+	Leader string `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main leader,attr"`
+	Pos    string `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main pos,attr"`
+}
+
+func (t *xmlTabs) list() []xmlTab {
+	if t == nil {
+		return nil
+	}
+	return t.Tabs
+}
+
+// mergeTabs applies own's stops over inherited ones: a stop at a position
+// replaces the inherited stop there, and a "clear" stop removes it. A nil
+// result means neither declared any.
+func mergeTabs(own, inherited *xmlTabs) *xmlTabs {
+	if own == nil {
+		return inherited
+	}
+	var out []xmlTab
+	for _, t := range inherited.list() {
+		if !slices.ContainsFunc(own.Tabs, func(o xmlTab) bool { return dxaToPt(o.Pos) == dxaToPt(t.Pos) }) {
+			out = append(out, t)
+		}
+	}
+	for _, t := range own.Tabs {
+		if !strings.EqualFold(strings.TrimSpace(t.Val), "clear") {
+			out = append(out, t)
+		}
+	}
+	return &xmlTabs{Tabs: out}
+}
+
+// tabStopsFrom resolves merged w:tabs into the paragraph's stops, sorted by
+// position. A bar tab only draws a vertical rule, which is not modeled, and is
+// no stop at all, so it is dropped.
+func tabStopsFrom(t *xmlTabs) []TabStop {
+	var out []TabStop
+	for _, x := range t.list() {
+		stop := TabStop{PosPt: dxaToPt(x.Pos), Leader: tabLeaders[strings.ToLower(strings.TrimSpace(x.Leader))]}
+		switch strings.ToLower(strings.TrimSpace(x.Val)) {
+		case "clear", "bar":
+			continue
+		case "center":
+			stop.Align = TabCenter
+		case "right", "end":
+			stop.Align = TabRight
+		case "decimal":
+			stop.Align = TabDecimal
+		default: // "left", "start", "num"
+			stop.Align = TabLeft
+		}
+		out = append(out, stop)
+	}
+	slices.SortStableFunc(out, func(a, b TabStop) int { return cmp.Compare(a.PosPt, b.PosPt) })
+	return out
+}
+
+// tabLeaders maps w:tab/@w:leader onto the character the leader repeats.
+var tabLeaders = map[string]string{
+	"dot":        ".",
+	"hyphen":     "-",
+	"underscore": "_",
+	"heavy":      "_",
+	"middledot":  "·",
 }
 
 // xmlNumPr is <w:numPr>: a reference into word/numbering.xml by list id
@@ -227,7 +347,7 @@ type xmlPSpacing struct {
 // children via a custom UnmarshalXML (encoding/xml's separate slices would lose
 // the document order of <w:t>, <w:br> and <w:drawing>, which matters for
 // in-paragraph line breaks and inline images). Unsupported run children (e.g.
-// <w:tab>) are skipped without error.
+// <w:sym>) are skipped without error.
 type xmlRun struct {
 	Props   *xmlRPr
 	Content []xmlRunContent
@@ -244,13 +364,15 @@ type xmlRunContent struct {
 	// carry PAGE/NUMPAGES fields, whose displayed value is computed at render.
 	FldChar   *string
 	InstrText *string
+	// Tab is a <w:tab/>: an advance to the paragraph's next tab stop.
+	Tab bool
 }
 
 func (r *xmlRun) UnmarshalXML(d *xml.Decoder, _ xml.StartElement) error {
 	for {
 		tok, err := d.Token()
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				return nil
 			}
 			return err
@@ -288,6 +410,22 @@ func (r *xmlRun) UnmarshalXML(d *xml.Decoder, _ xml.StartElement) error {
 				return err
 			}
 			r.Content = append(r.Content, xmlRunContent{Break: &b})
+		case "cr":
+			if err := d.Skip(); err != nil {
+				return err
+			}
+			r.Content = append(r.Content, xmlRunContent{Break: &xmlBr{}})
+		case "tab":
+			if err := d.Skip(); err != nil {
+				return err
+			}
+			r.Content = append(r.Content, xmlRunContent{Tab: true})
+		case "noBreakHyphen":
+			if err := d.Skip(); err != nil {
+				return err
+			}
+			s := "-"
+			r.Content = append(r.Content, xmlRunContent{Text: &s})
 		case "drawing":
 			var dr xmlDrawing
 			if err := d.DecodeElement(&dr, &start); err != nil {
@@ -503,10 +641,25 @@ type xmlTrHeight struct {
 	HRule string `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main hRule,attr"`
 }
 
+// xmlCell is a <w:tc>: its properties plus its paragraphs and nested tables in
+// document order.
 type xmlCell struct {
-	Props        *xmlTcPr       `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main tcPr"`
-	Paragraphs   []xmlParagraph `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main p"`
-	NestedTables []xmlTable     `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main tbl"`
+	Props    *xmlTcPr
+	Children []xmlBodyChild
+}
+
+func (c *xmlCell) UnmarshalXML(d *xml.Decoder, _ xml.StartElement) error {
+	return decodeBlocks(d, &c.Children, func(start xml.StartElement) (bool, error) {
+		if start.Name.Local != "tcPr" {
+			return false, nil
+		}
+		var pr xmlTcPr
+		if err := d.DecodeElement(&pr, &start); err != nil {
+			return true, err
+		}
+		c.Props = &pr
+		return true, nil
+	})
 }
 
 type xmlTcPr struct {
@@ -796,9 +949,7 @@ func mergeTblStylePrRegions(own, parent map[string]resolvedTableStyleRegion) map
 		return nil
 	}
 	out := make(map[string]resolvedTableStyleRegion)
-	for k, v := range parent {
-		out[k] = v
-	}
+	maps.Copy(out, parent)
 	for k, o := range own {
 		p := out[k]
 		out[k] = resolvedTableStyleRegion{
@@ -861,6 +1012,7 @@ func mergePPr(own, fallback *xmlPPr) *xmlPPr {
 		Spacing: mergeSpacing(o.Spacing, f.Spacing),
 		NumPr:   coalesceNumPr(o.NumPr, f.NumPr),
 		Shd:     coalesceShd(o.Shd, f.Shd),
+		Tabs:    mergeTabs(o.Tabs, f.Tabs),
 	}
 }
 
@@ -977,6 +1129,7 @@ type resolvedParaStyle struct {
 	Ind     *xmlInd
 	NumPr   *xmlNumPr
 	Shd     *xmlShd
+	Tabs    *xmlTabs
 	RPr     *xmlRPr
 }
 
@@ -1021,6 +1174,7 @@ func resolveParaStyle(id string, defs map[string]xmlStyle, cache map[string]reso
 		own.Ind = def.PPr.Ind
 		own.NumPr = def.PPr.NumPr
 		own.Shd = def.PPr.Shd
+		own.Tabs = def.PPr.Tabs
 	}
 	own.RPr = def.RPr
 	var parent resolvedParaStyle
@@ -1033,6 +1187,7 @@ func resolveParaStyle(id string, defs map[string]xmlStyle, cache map[string]reso
 		Ind:     coalesceInd(own.Ind, parent.Ind),
 		NumPr:   coalesceNumPr(own.NumPr, parent.NumPr),
 		Shd:     coalesceShd(own.Shd, parent.Shd),
+		Tabs:    mergeTabs(own.Tabs, parent.Tabs),
 		RPr:     mergeRPr(own.RPr, parent.RPr),
 	}
 	cache[id] = merged
@@ -1248,14 +1403,6 @@ func buildBody(body xmlBody, sc styleContext) ([]BodyElement, []sectionBreak) {
 	return elems, breaks
 }
 
-func buildParagraphSlice(xps []xmlParagraph, sc styleContext) []Paragraph {
-	paras := make([]Paragraph, 0, len(xps))
-	for _, xp := range xps {
-		paras = append(paras, buildParagraph(xp, sc))
-	}
-	return paras
-}
-
 func buildParagraph(xp xmlParagraph, sc styleContext) Paragraph {
 	var p Paragraph
 	var inlinePPr *xmlPPr
@@ -1305,6 +1452,20 @@ func buildParagraph(xp xmlParagraph, sc styleContext) Paragraph {
 	}
 	p.Props.Shading = resolveShading(shd, sc.theme)
 
+	// Tab stops accumulate down the tiers rather than one tier winning:
+	// docDefaults/table style, then the paragraph style, then the paragraph.
+	var tabs *xmlTabs
+	if under != nil {
+		tabs = under.Tabs
+	}
+	if hasStyle {
+		tabs = mergeTabs(ps.Tabs, tabs)
+	}
+	if inlinePPr != nil {
+		tabs = mergeTabs(inlinePPr.Tabs, tabs)
+	}
+	p.Props.Tabs = tabStopsFrom(tabs)
+
 	// Numbering: prepend a marker run and (when the paragraph declared no
 	// indent) borrow the level's hanging indent.
 	if m, ok := resolveMarker(inlinePPr, ps, hasStyle, sc); ok {
@@ -1319,7 +1480,10 @@ func buildParagraph(xp xmlParagraph, sc styleContext) Paragraph {
 	if hasStyle {
 		pStyleRPr = ps.RPr
 	}
-	var fld fieldState
+	// A page/column break before any content (the list marker aside) belongs to
+	// the paragraph; one after content is a run, so the content before it stays
+	// on the current page.
+	fld := fieldState{lead: len(p.Runs)}
 	for _, item := range xp.Items {
 		switch {
 		case item.Run != nil:
@@ -1332,7 +1496,7 @@ func buildParagraph(xp xmlParagraph, sc styleContext) Paragraph {
 				appendRun(&p, xr, pStyleRPr, sc, &fld)
 			}
 		case item.FldSimple != nil:
-			appendSimpleField(&p, *item.FldSimple, pStyleRPr, sc)
+			appendSimpleField(&p, *item.FldSimple, pStyleRPr, sc, fld.lead)
 		}
 	}
 	return p
@@ -1342,13 +1506,16 @@ func buildParagraph(xp xmlParagraph, sc styleContext) Paragraph {
 // walks a paragraph's runs. Between begin and separate the field code is
 // collected; once it is known to be PAGE/NUMPAGES a single computed run is
 // emitted and the cached result runs (up to end) are suppressed. Any other field
-// leaves suppress false, so its cached result flows as ordinary text.
+// leaves suppress false, so its cached result flows as ordinary text. lead is
+// how many runs (a list marker) precede the paragraph's own content; it is
+// paragraph-wide and survives the reset at each field's begin/end.
 type fieldState struct {
 	active   bool
 	inInstr  bool
 	suppress bool
 	emitted  bool
 	instr    strings.Builder
+	lead     int
 }
 
 // appendRun turns one <w:r> into paragraph runs, feeding its content through the
@@ -1360,7 +1527,7 @@ func appendRun(p *Paragraph, xr xmlRun, pStyleRPr *xmlRPr, sc styleContext, fld 
 		case c.FldChar != nil:
 			switch strings.ToLower(strings.TrimSpace(*c.FldChar)) {
 			case "begin":
-				*fld = fieldState{active: true, inInstr: true}
+				*fld = fieldState{active: true, inInstr: true, lead: fld.lead}
 			case "separate":
 				fld.inInstr = false
 				if fld.active && !fld.emitted {
@@ -1375,7 +1542,7 @@ func appendRun(p *Paragraph, xr xmlRun, pStyleRPr *xmlRPr, sc styleContext, fld 
 						p.Runs = append(p.Runs, Run{Field: k, Props: props})
 					}
 				}
-				*fld = fieldState{}
+				*fld = fieldState{lead: fld.lead}
 			}
 		case c.InstrText != nil:
 			if fld.active && fld.inInstr {
@@ -1384,11 +1551,20 @@ func appendRun(p *Paragraph, xr xmlRun, pStyleRPr *xmlRPr, sc styleContext, fld 
 		case fld.active && (fld.inInstr || fld.suppress):
 			// Instruction region, or a known field's cached result: draw nothing.
 		case c.Break != nil:
+			atStart := len(p.Runs) == fld.lead
 			switch strings.ToLower(strings.TrimSpace(c.Break.Type)) {
 			case "page":
-				p.Props.PageBreak = true
+				if atStart {
+					p.Props.PageBreak = true
+				} else {
+					p.Runs = append(p.Runs, Run{PageBreak: true})
+				}
 			case "column":
-				p.Props.ColumnBreak = true
+				if atStart {
+					p.Props.ColumnBreak = true
+				} else {
+					p.Runs = append(p.Runs, Run{ColumnBreak: true})
+				}
 			default:
 				p.Runs = append(p.Runs, Run{LineBreak: true})
 			}
@@ -1400,6 +1576,8 @@ func appendRun(p *Paragraph, xr xmlRun, pStyleRPr *xmlRPr, sc styleContext, fld 
 			if img := c.Pict.image(sc.images); img != nil {
 				p.Runs = append(p.Runs, Run{Image: img, Props: props})
 			}
+		case c.Tab:
+			p.Runs = append(p.Runs, Run{Tab: true, Props: props})
 		case c.Text != nil && *c.Text != "":
 			p.Runs = append(p.Runs, Run{Text: *c.Text, Props: props})
 		}
@@ -1408,7 +1586,7 @@ func appendRun(p *Paragraph, xr xmlRun, pStyleRPr *xmlRPr, sc styleContext, fld 
 
 // appendSimpleField turns a <w:fldSimple> into a computed run for PAGE/NUMPAGES,
 // or - for any other field - surfaces its cached result runs as ordinary text.
-func appendSimpleField(p *Paragraph, fs xmlFldSimple, pStyleRPr *xmlRPr, sc styleContext) {
+func appendSimpleField(p *Paragraph, fs xmlFldSimple, pStyleRPr *xmlRPr, sc styleContext, lead int) {
 	if k := classifyField(fs.Instr); k != "" {
 		props := resolveRunProps(nil, pStyleRPr, sc)
 		if len(fs.Runs) > 0 {
@@ -1417,7 +1595,7 @@ func appendSimpleField(p *Paragraph, fs xmlFldSimple, pStyleRPr *xmlRPr, sc styl
 		p.Runs = append(p.Runs, Run{Field: k, Props: props})
 		return
 	}
-	var ignored fieldState
+	ignored := fieldState{lead: lead}
 	for _, xr := range fs.Runs {
 		appendRun(p, xr, pStyleRPr, sc, &ignored)
 	}
@@ -1609,11 +1787,12 @@ func spacingFrom(sp *xmlPSpacing) Spacing {
 // lineSpacingFrom resolves w:line/w:lineRule into a rule and its value: a
 // multiple for "auto" (w:line in 240ths of a line, e.g. 276 → 1.15), or a
 // point height for "exact"/"atLeast" (w:line in dxa). An absent w:lineRule
-// with a w:line defaults to "auto" (per OOXML); an absent or unparseable
-// w:line yields the single (default) rule.
+// with a w:line defaults to "auto" (per OOXML); an absent, unparseable or
+// non-positive w:line yields the single (default) rule, since a zero line height
+// would draw every line of the paragraph on top of the first.
 func lineSpacingFrom(line, rule string) (LineSpacingRule, float64) {
 	v, err := strconv.ParseFloat(strings.TrimSpace(line), 64)
-	if err != nil {
+	if err != nil || v <= 0 {
 		return LineSpacingSingle, 0
 	}
 	switch strings.ToLower(strings.TrimSpace(rule)) {
@@ -1963,8 +2142,9 @@ func buildCell(xc xmlCell, tc tableContext, rowIdx, colStart int, sc styleContex
 		firstCol: colStart == 0,
 		lastCol:  colStart+span >= tc.nCols,
 	}
+	content, _ := buildBody(xmlBody{Children: xc.Children}, cellSC)
 	cell := Cell{
-		Paragraphs:    buildParagraphSlice(xc.Paragraphs, cellSC),
+		Content:       content,
 		ColSpan:       span,
 		VMerge:        vMergeState(xc.Props),
 		Borders:       resolveCellBorders(tblBorders, cellBorders, pos),
@@ -1973,9 +2153,13 @@ func buildCell(xc xmlCell, tc tableContext, rowIdx, colStart int, sc styleContex
 		TextDirection: textDirectionFrom(textDirOf(xc.Props)),
 		VAlign:        vAlignFrom(vAlignOf(xc.Props)),
 	}
-	if len(xc.NestedTables) > 0 {
-		nested := buildTable(xc.NestedTables[0], cellSC)
-		cell.Nested = &nested
+	for _, el := range content {
+		switch {
+		case el.Paragraph != nil:
+			cell.Paragraphs = append(cell.Paragraphs, *el.Paragraph)
+		case el.Table != nil && cell.Nested == nil:
+			cell.Nested = el.Table
+		}
 	}
 	return cell
 }
@@ -2162,6 +2346,11 @@ func vertBandType(colStart, nCols int, flags tblLookFlags, bandSize int) string 
 	return "band2Vert"
 }
 
+// maxGridColumns is Word's own limit on a table's columns. A cell's w:gridSpan
+// is clamped to it: the column-width arrays grow to cover every span, so an
+// absurd span in an untrusted file would otherwise allocate without bound.
+const maxGridColumns = 63
+
 func gridSpan(tcPr *xmlTcPr) int {
 	if tcPr == nil || tcPr.GridSpan == nil {
 		return 1
@@ -2170,7 +2359,7 @@ func gridSpan(tcPr *xmlTcPr) int {
 	if err != nil || n < 1 {
 		return 1
 	}
-	return n
+	return min(n, maxGridColumns)
 }
 
 func vMergeState(tcPr *xmlTcPr) VMergeState {
@@ -2267,7 +2456,12 @@ func resolveBorderSide(tblSide, cellSide *xmlBorder) BorderSide {
 	if b == nil {
 		b = tblSide
 	}
-	if b == nil || strings.EqualFold(strings.TrimSpace(b.Val), "none") {
+	if b == nil {
+		return BorderSide{}
+	}
+	// "nil" is how a cell removes a border it would otherwise inherit.
+	switch strings.ToLower(strings.TrimSpace(b.Val)) {
+	case "none", "nil":
 		return BorderSide{}
 	}
 	width := eighthsToPt(b.Sz) // border w:sz is in eighths of a point
@@ -2421,9 +2615,11 @@ func buildPageGeometry(sp *xmlSectPr) PageGeometry {
 		}
 	}
 	if sp.PgMar != nil {
-		g.MarginTopPt = dxaToPtOr(sp.PgMar.Top, defaultMarginPt)
+		// A negative top/bottom margin only says the header/footer may not push
+		// the text; the text still starts at its absolute value.
+		g.MarginTopPt = math.Abs(dxaToPtOr(sp.PgMar.Top, defaultMarginPt))
 		g.MarginRightPt = dxaToPtOr(sp.PgMar.Right, defaultMarginPt)
-		g.MarginBottomPt = dxaToPtOr(sp.PgMar.Bottom, defaultMarginPt)
+		g.MarginBottomPt = math.Abs(dxaToPtOr(sp.PgMar.Bottom, defaultMarginPt))
 		g.MarginLeftPt = dxaToPtOr(sp.PgMar.Left, defaultMarginPt)
 	}
 	return g
@@ -2824,7 +3020,7 @@ func formatMarker(def numDef, ilvl int, counters map[int]int) string {
 		return lvl.lvlText
 	}
 	s := lvl.lvlText
-	for k := 0; k <= ilvl; k++ {
+	for k := 0; k <= min(ilvl, 8); k++ { // lvlText has only %1..%9
 		placeholder := "%" + strconv.Itoa(k+1)
 		if !strings.Contains(s, placeholder) {
 			continue
@@ -2855,24 +3051,28 @@ func formatNumber(n int, numFmt string) string {
 	}
 }
 
-// toLetter renders n (1-based) as a spreadsheet-style letter sequence from base
-// ('a' or 'A'): 1→a, 26→z, 27→aa. n<1 yields "".
+// maxLetterNumber is the last value Word renders as letters (30 repetitions of
+// z); beyond it - and for a hostile w:start - the repeated-letter form would
+// grow without bound.
+const maxLetterNumber = 26 * 30
+
+// toLetter renders n (1-based) the way Word letters a list, repeating the letter
+// past z from base ('a' or 'A'): 1→a, 26→z, 27→aa, 28→bb. n<1 yields "", and n
+// past maxLetterNumber falls back to decimal.
 func toLetter(n int, base rune) string {
 	if n < 1 {
 		return ""
 	}
-	var out []rune
-	for n > 0 {
-		n--
-		out = append([]rune{base + rune(n%26)}, out...)
-		n /= 26
+	if n > maxLetterNumber {
+		return strconv.Itoa(n)
 	}
-	return string(out)
+	return strings.Repeat(string(base+rune((n-1)%26)), (n-1)/26+1)
 }
 
-// toRoman renders n as an uppercase Roman numeral; n<=0 falls back to decimal.
+// toRoman renders n as an uppercase Roman numeral; n<=0, and n past 3999 (where
+// the numerals would need an overline), fall back to decimal.
 func toRoman(n int) string {
-	if n <= 0 {
+	if n <= 0 || n > 3999 {
 		return strconv.Itoa(n)
 	}
 	vals := []int{1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1}

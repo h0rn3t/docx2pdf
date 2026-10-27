@@ -35,3 +35,6 @@ CLAUDE.md
 test.docx
 test.pdf
 .claude
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/

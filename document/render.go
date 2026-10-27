@@ -48,6 +48,23 @@ func fillFields(p Paragraph, pageNo int) Paragraph {
 	return p
 }
 
+// setPageNumber rewrites ln's PAGE field words to pageNo and re-measures them:
+// a paragraph that runs onto another page was laid out with the page it started
+// on, and a number with more digits must push what follows it along.
+func setPageNumber(r renderer, ln *line, pageNo int) {
+	for i := range ln.words {
+		w := &ln.words[i]
+		if w.field != FieldPage {
+			continue
+		}
+		w.text = strconv.Itoa(pageNo)
+		r.SetFont(w.props.FontFamily, w.props.Bold, w.props.Italic, w.props.Underline, w.props.SizePt)
+		width := r.TextWidth(w.text)
+		ln.natural += width - w.width
+		w.width = width
+	}
+}
+
 // WritePDF renders the document and writes the PDF to path, in one call:
 //
 //	doc, err := document.Open("in.docx")
@@ -171,6 +188,9 @@ func (f *flow) newPage() {
 		return
 	}
 	f.r.AddPage(f.sec.sec.Geometry.WidthPt, f.sec.sec.Geometry.HeightPt)
+	// A continuous section started mid-page; every page after that one starts
+	// its columns at the top margin again.
+	f.sec = f.sec.startingAt(pageFrom(f.sec.sec.Geometry).originY)
 	f.pageInSection++
 	f.pageNo++
 	drawHeaderFooter(f.r, f.sec, f.pageInSection, f.pageNo)
@@ -280,6 +300,7 @@ func renderParagraph(f *flow, p Paragraph) {
 	f.y += p.Props.Spacing.BeforePt
 
 	p = fillFields(p, f.pageNo)
+	laidOutOn := f.pageNo
 	lines := layoutParagraph(f.r, p, f.frame().contentWidth-p.Props.Indent.LeftPt-p.Props.Indent.RightPt)
 	if len(lines) == 0 { // empty paragraph advances one line at its line spacing
 		h := lineHeightFor(defaultRenderSizePt, 0, p.Props.Spacing)
@@ -293,8 +314,18 @@ func renderParagraph(f *flow, p Paragraph) {
 	}
 
 	for i, ln := range lines {
+		switch ln.breakBefore {
+		case breakPage:
+			f.newPage()
+		case breakColumn:
+			f.breakFrame()
+		case breakNone:
+		}
 		if f.y+ln.height > f.frame().bottomLimit && !f.atTop {
 			f.breakFrame()
+		}
+		if f.pageNo != laidOutOn {
+			setPageNumber(f.r, &ln, f.pageNo)
 		}
 		fr := f.frame()
 		innerX := fr.originX + p.Props.Indent.LeftPt
@@ -316,13 +347,17 @@ func renderParagraph(f *flow, p Paragraph) {
 
 // drawHeaderFooter draws the section's header and footer on the page that has
 // just been added. On a title page (w:titlePg) the "first" parts replace the
-// default ones - and when the section declares none, the page simply gets no
-// header/footer, which is exactly what Word draws.
+// default ones, and on an even page of a document with w:evenAndOddHeaders the
+// "even" parts do - when the section has none of that kind, the page simply
+// gets no header/footer, which is exactly what Word draws.
 func drawHeaderFooter(r renderer, sl sectionLayout, pageInSection, pageNo int) {
 	s := sl.sec
 	hdr, ftr := s.Header, s.Footer
-	if s.TitlePage && pageInSection == 1 {
+	switch {
+	case s.TitlePage && pageInSection == 1:
 		hdr, ftr = s.FirstHeader, s.FirstFooter
+	case s.EvenAndOddHeaders && pageNo%2 == 0:
+		hdr, ftr = s.EvenHeader, s.EvenFooter
 	}
 	base := pageFrom(s.Geometry)
 	if len(hdr) > 0 {

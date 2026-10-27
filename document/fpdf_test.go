@@ -32,6 +32,9 @@ func TestMapFontFamily(t *testing.T) {
 		{"Fira Code", fonts.Mono},
 		{"Cascadia Code", fonts.Mono},
 		{"JetBrains Mono", fonts.Mono},
+		{"Microsoft Sans Serif", fonts.Sans},
+		{"Fira Sans", fonts.Sans},
+		{"DejaVu Sans Mono", fonts.Mono},
 	}
 	for _, tt := range tests {
 		if got := mapFontFamily(tt.name); got != tt.want {

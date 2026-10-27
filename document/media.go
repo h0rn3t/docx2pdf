@@ -4,11 +4,13 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/xml"
+	"fmt"
 	"image"
-	_ "image/gif"  // registers GIF for DecodeConfig (intrinsic image size)
+	_ "image/gif"  // registers GIF for DecodeConfig (format sniffing, intrinsic size)
 	_ "image/jpeg" // registers JPEG for DecodeConfig
-	_ "image/png"  // registers PNG for DecodeConfig
+	"image/png"
 	"io"
+	"io/fs"
 	"path"
 	"strconv"
 	"strings"
@@ -23,6 +25,7 @@ type xmlRelationships struct {
 // xmlRelationship is one <Relationship> (its attributes are unqualified).
 type xmlRelationship struct {
 	ID         string `xml:"Id,attr"`
+	Type       string `xml:"Type,attr"`
 	Target     string `xml:"Target,attr"`
 	TargetMode string `xml:"TargetMode,attr"`
 }
@@ -42,50 +45,96 @@ func newPkg(files []*zip.File) *pkg {
 	return &pkg{parts: parts, media: make(map[string][]byte)}
 }
 
-// part returns the named part's decoded bytes, or ok=false when it is absent or
-// unreadable. Optional parts degrade rather than failing Open.
-func (p *pkg) part(name string) ([]byte, bool) {
+// maxPartSize caps how many decompressed bytes one package part may hold. A
+// .docx is untrusted input and ZIP deflate reaches ratios above 1000:1, so
+// without a cap a few kilobytes of archive could exhaust memory.
+const maxPartSize = 256 << 20
+
+// part returns the named part's decompressed bytes. The error wraps
+// fs.ErrNotExist when the part is absent; any error means the part is unusable,
+// and callers of optional parts degrade rather than failing Open.
+func (p *pkg) part(name string) ([]byte, error) {
 	f, ok := p.parts[name]
 	if !ok {
-		return nil, false
+		return nil, fmt.Errorf("part %s: %w", name, fs.ErrNotExist)
+	}
+	if f.UncompressedSize64 > maxPartSize {
+		return nil, fmt.Errorf("part %s: larger than %d bytes", name, maxPartSize)
 	}
 	rc, err := f.Open()
 	if err != nil {
-		return nil, false
+		return nil, fmt.Errorf("part %s: %w", name, err)
 	}
 	defer func() { _ = rc.Close() }()
 
-	b, err := io.ReadAll(rc)
+	// The declared size can lie, so the read itself is bounded too.
+	b, err := io.ReadAll(io.LimitReader(rc, maxPartSize+1))
 	if err != nil {
-		return nil, false
+		return nil, fmt.Errorf("part %s: %w", name, err)
 	}
-	return b, true
+	if len(b) > maxPartSize {
+		return nil, fmt.Errorf("part %s: larger than %d bytes", name, maxPartSize)
+	}
+	return b, nil
 }
 
-// rels reads the relationship part belonging to partName (e.g.
-// word/_rels/document.xml.rels for word/document.xml) and returns rId → part
-// name, with each Target resolved against the owning part's directory.
-// External-mode relationships (TargetMode="External") are skipped: they point
-// outside the package, and linked-not-embedded media is out of scope. A missing
-// or malformed .rels degrades to an empty map.
-func (p *pkg) rels(partName string) map[string]string {
-	dir := path.Dir(partName)
-	data, ok := p.part(path.Join(dir, "_rels", path.Base(partName)+".rels"))
-	if !ok {
+// relationships reads the relationship part belonging to partName (e.g.
+// word/_rels/document.xml.rels for word/document.xml, or _rels/.rels for the
+// package itself when partName is "") with each Target resolved to a part name:
+// against the owning part's directory, or - for a Target starting with "/" -
+// against the package root. External-mode relationships (TargetMode="External")
+// are skipped: they point outside the package, and linked-not-embedded media is
+// out of scope. A missing or malformed .rels yields none.
+func (p *pkg) relationships(partName string) []xmlRelationship {
+	dir, relsName := "", "_rels/.rels"
+	if partName != "" {
+		dir = path.Dir(partName)
+		relsName = path.Join(dir, "_rels", path.Base(partName)+".rels")
+	}
+	data, err := p.part(relsName)
+	if err != nil {
 		return nil
 	}
 	var xr xmlRelationships
 	if xml.Unmarshal(data, &xr) != nil {
 		return nil
 	}
-	out := make(map[string]string, len(xr.Rels))
+	out := xr.Rels[:0]
 	for _, rel := range xr.Rels {
 		if rel.ID == "" || rel.Target == "" || strings.EqualFold(rel.TargetMode, "External") {
 			continue
 		}
-		out[rel.ID] = path.Clean(path.Join(dir, rel.Target))
+		if abs, ok := strings.CutPrefix(rel.Target, "/"); ok {
+			rel.Target = path.Clean(abs)
+		} else {
+			rel.Target = path.Clean(path.Join(dir, rel.Target))
+		}
+		out = append(out, rel)
 	}
 	return out
+}
+
+// rels returns partName's relationships as rId → part name.
+func (p *pkg) rels(partName string) map[string]string {
+	rels := p.relationships(partName)
+	out := make(map[string]string, len(rels))
+	for _, rel := range rels {
+		out[rel.ID] = rel.Target
+	}
+	return out
+}
+
+// relatedPart returns the part partName relates to by a relationship of the
+// given kind (the last segment of its Type URI, e.g. "styles", so the
+// transitional and strict OOXML namespaces both match), or fallback when it
+// declares none.
+func (p *pkg) relatedPart(partName, kind, fallback string) string {
+	for _, rel := range p.relationships(partName) {
+		if strings.HasSuffix(rel.Type, "/"+kind) {
+			return rel.Target
+		}
+	}
+	return fallback
 }
 
 // imageResolver turns a relationship id (r:embed on a DrawingML blip, r:id on a
@@ -104,8 +153,10 @@ func (p *pkg) resolverFor(partName string) *imageResolver {
 // resolve loads the image referenced by rID at the requested size. A zero or
 // missing size falls back to the picture's intrinsic pixel size at 96 dpi.
 // It returns nil - and the caller drops the picture, keeping the conversion
-// successful - when the id is unknown, the media part is missing, or its format
-// is one the PDF backend cannot embed (EMF/WMF/SVG/TIFF).
+// successful - when the id is unknown, the media part is missing, or its bytes
+// are not an image the PDF backend can embed (EMF/WMF/SVG/TIFF, or a corrupt
+// blob). The format is sniffed from the bytes, not the part's extension, so a
+// mislabeled picture still draws instead of failing the whole PDF.
 func (ir *imageResolver) resolve(rID string, widthPt, heightPt float64) *Image {
 	if ir == nil || rID == "" {
 		return nil
@@ -114,50 +165,56 @@ func (ir *imageResolver) resolve(rID string, widthPt, heightPt float64) *Image {
 	if name == "" {
 		return nil
 	}
-	typ := imageType(name)
-	if typ == "" {
-		return nil
-	}
 	data, cached := ir.pkg.media[name]
 	if !cached {
-		var ok bool
-		if data, ok = ir.pkg.part(name); !ok {
-			return nil
+		if raw, err := ir.pkg.part(name); err == nil {
+			data = embeddable(raw)
 		}
-		ir.pkg.media[name] = data
+		ir.pkg.media[name] = data // nil remembers an unusable part
+	}
+	if data == nil {
+		return nil
+	}
+	cfg, format, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return nil
 	}
 	if widthPt <= 0 || heightPt <= 0 {
-		if widthPt, heightPt = intrinsicSizePt(data); widthPt <= 0 || heightPt <= 0 {
+		// Intrinsic size: pixels at 96 dpi, Word's own screen-pixel assumption.
+		widthPt, heightPt = float64(cfg.Width)*72/96, float64(cfg.Height)*72/96
+		if widthPt <= 0 || heightPt <= 0 {
 			return nil
 		}
 	}
-	return &Image{Name: name, Type: typ, Data: data, WidthPt: widthPt, HeightPt: heightPt}
+	return &Image{Name: name, Type: fpdfImageTypes[format], Data: data, WidthPt: widthPt, HeightPt: heightPt}
 }
 
-// imageType maps a media part's extension onto the fpdf image type, or "" for a
-// format the backend cannot embed.
-func imageType(name string) string {
-	switch strings.ToLower(path.Ext(name)) {
-	case ".png":
-		return "PNG"
-	case ".jpg", ".jpeg":
-		return "JPG"
-	case ".gif":
-		return "GIF"
-	default: // .emf/.wmf/.svg/.tif: no fpdf support
-		return ""
+// fpdfImageTypes maps an image.DecodeConfig format name onto the fpdf image
+// type; a format missing here is one the backend cannot embed.
+var fpdfImageTypes = map[string]string{"png": "PNG", "jpeg": "JPG", "gif": "GIF"}
+
+// embeddable returns data in a form the fpdf backend accepts, or nil when it is
+// not a PNG, JPEG or GIF. fpdf rejects interlaced PNGs - and a rejected image
+// fails the whole PDF - so those are re-encoded, which Go's encoder always
+// writes non-interlaced.
+func embeddable(data []byte) []byte {
+	_, format, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil || fpdfImageTypes[format] == "" {
+		return nil
 	}
-}
-
-// intrinsicSizePt reads an image's pixel dimensions from its header and
-// converts them to points at 96 dpi (Word's own screen-pixel assumption),
-// used when a picture declares no explicit extent.
-func intrinsicSizePt(data []byte) (float64, float64) {
-	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
+	// IHDR's interlace method is byte 28: 8 signature + 8 chunk header + 12.
+	if format != "png" || len(data) <= 28 || data[28] == 0 {
+		return data
+	}
+	img, err := png.Decode(bytes.NewReader(data))
 	if err != nil {
-		return 0, 0
+		return nil
 	}
-	return float64(cfg.Width) * 72 / 96, float64(cfg.Height) * 72 / 96
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		return nil
+	}
+	return buf.Bytes()
 }
 
 // emuToPt converts English Metric Units (the unit wp:extent uses) to points:
@@ -204,7 +261,7 @@ func (p *xmlPict) image(ir *imageResolver) *Image {
 // lower-cased property→value pairs.
 func parseVMLStyle(style string) map[string]string {
 	out := make(map[string]string)
-	for _, decl := range strings.Split(style, ";") {
+	for decl := range strings.SplitSeq(style, ";") {
 		k, v, ok := strings.Cut(decl, ":")
 		if !ok {
 			continue

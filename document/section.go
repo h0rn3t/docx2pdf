@@ -37,6 +37,10 @@ type xmlHdrFtrRef struct {
 	ID   string `xml:"http://schemas.openxmlformats.org/officeDocument/2006/relationships id,attr"`
 }
 
+// maxColumns is Word's own limit on a section's columns; w:num is clamped to it
+// so an absurd count in an untrusted file cannot allocate without bound.
+const maxColumns = 45
+
 // defaultColumnSpacePt is the gap Word puts between columns when w:cols
 // declares none (720 dxa = 0.5").
 const defaultColumnSpacePt = 36.0
@@ -69,13 +73,25 @@ type Section struct {
 	Continuous bool
 	// Header/Footer are the default page's content; FirstHeader/FirstFooter
 	// replace them on the section's first page when TitlePage is set (an empty
-	// slice then means "no header on the title page", which is what Word draws).
+	// slice then means "no header on the title page", which is what Word draws),
+	// and EvenHeader/EvenFooter on even-numbered pages when EvenAndOddHeaders is
+	// set. A section that references no part of a kind inherits the previous
+	// section's.
 	Header, Footer           []BodyElement
 	FirstHeader, FirstFooter []BodyElement
+	EvenHeader, EvenFooter   []BodyElement
 	TitlePage                bool
+	// EvenAndOddHeaders is the document-wide w:evenAndOddHeaders setting
+	// (word/settings.xml), copied onto every section.
+	EvenAndOddHeaders bool
 	// HeaderOffsetPt/FooterOffsetPt are w:pgMar's w:header/w:footer: the header's
 	// distance from the top edge of the page, and the footer's from the bottom.
 	HeaderOffsetPt, FooterOffsetPt float64
+}
+
+// xmlSettings is word/settings.xml; only the even/odd header switch is modeled.
+type xmlSettings struct {
+	EvenAndOddHeaders *xmlOnOff `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main evenAndOddHeaders"`
 }
 
 // sectionBreak records a mid-body w:sectPr: the section's properties and the
@@ -88,14 +104,57 @@ type sectionBreak struct {
 // buildSections turns the mid-body section breaks plus the body-level w:sectPr
 // (the last section's properties) into the document's sections. A document with
 // neither still gets one default section covering the whole body, so the
-// renderer always has a section to draw in.
-func buildSections(breaks []sectionBreak, last *xmlSectPr, bodyLen int, p *pkg, sc styleContext) []Section {
+// renderer always has a section to draw in. Each header/footer kind a section
+// does not reference is inherited from the section before it.
+func buildSections(breaks []sectionBreak, last *xmlSectPr, bodyLen int, evenAndOdd bool, p *pkg, sc styleContext) []Section {
 	sects := make([]Section, 0, len(breaks)+1)
 	for _, b := range breaks {
 		sects = append(sects, buildSection(b.props, b.end, p, sc))
 	}
 	sects = append(sects, buildSection(last, bodyLen, p, sc))
+	for i := range sects {
+		sects[i].EvenAndOddHeaders = evenAndOdd
+	}
+	for i := 1; i < len(sects); i++ {
+		sp := last
+		if i < len(breaks) {
+			sp = breaks[i].props
+		}
+		var hdrs, ftrs []xmlHdrFtrRef
+		if sp != nil {
+			hdrs, ftrs = sp.HeaderRefs, sp.FooterRefs
+		}
+		s, prev := &sects[i], sects[i-1]
+		if !hasRef(hdrs, "default") {
+			s.Header = prev.Header
+		}
+		if !hasRef(hdrs, "first") {
+			s.FirstHeader = prev.FirstHeader
+		}
+		if !hasRef(hdrs, "even") {
+			s.EvenHeader = prev.EvenHeader
+		}
+		if !hasRef(ftrs, "default") {
+			s.Footer = prev.Footer
+		}
+		if !hasRef(ftrs, "first") {
+			s.FirstFooter = prev.FirstFooter
+		}
+		if !hasRef(ftrs, "even") {
+			s.EvenFooter = prev.EvenFooter
+		}
+	}
 	return sects
+}
+
+// hasRef reports whether refs names a part for the given page kind.
+func hasRef(refs []xmlHdrFtrRef, kind string) bool {
+	for _, ref := range refs {
+		if strings.EqualFold(strings.TrimSpace(ref.Type), kind) {
+			return true
+		}
+	}
+	return false
 }
 
 func buildSection(sp *xmlSectPr, end int, p *pkg, sc styleContext) Section {
@@ -124,8 +183,10 @@ func buildSection(sp *xmlSectPr, end int, p *pkg, sc styleContext) Section {
 	}
 	s.Header = headerFooter(sp.HeaderRefs, "default", p, sc)
 	s.FirstHeader = headerFooter(sp.HeaderRefs, "first", p, sc)
+	s.EvenHeader = headerFooter(sp.HeaderRefs, "even", p, sc)
 	s.Footer = headerFooter(sp.FooterRefs, "default", p, sc)
 	s.FirstFooter = headerFooter(sp.FooterRefs, "first", p, sc)
+	s.EvenFooter = headerFooter(sp.FooterRefs, "even", p, sc)
 	return s
 }
 
@@ -162,6 +223,7 @@ func buildColumns(c *xmlCols, contentWidth float64) []Column {
 	if err != nil || n < 2 {
 		return full
 	}
+	n = min(n, maxColumns)
 	space := dxaToPtOr(c.Space, defaultColumnSpacePt)
 	width := (contentWidth - space*float64(n-1)) / float64(n)
 	if width <= 0 {
@@ -176,11 +238,11 @@ func buildColumns(c *xmlCols, contentWidth float64) []Column {
 }
 
 // headerFooter loads the header/footer part referenced for the given page class
-// (default/first) and builds its body elements. A reference to a missing or
+// (default/first/even) and builds its body elements. A reference to a missing or
 // malformed part, or no reference at all, yields nil - the page then simply has
 // no header/footer.
 func headerFooter(refs []xmlHdrFtrRef, class string, p *pkg, sc styleContext) []BodyElement {
-	rels := p.rels("word/document.xml")
+	rels := sc.images.rels // the main part's: header references live in it
 	for _, ref := range refs {
 		if !strings.EqualFold(strings.TrimSpace(ref.Type), class) {
 			continue
@@ -189,8 +251,8 @@ func headerFooter(refs []xmlHdrFtrRef, class string, p *pkg, sc styleContext) []
 		if name == "" {
 			continue
 		}
-		data, ok := p.part(name)
-		if !ok {
+		data, err := p.part(name)
+		if err != nil {
 			continue
 		}
 		// The root element (w:hdr/w:ftr) holds p/tbl children directly, which is

@@ -77,7 +77,7 @@ const (
 var Families = []string{Sans, Serif, Mono, Carlito}
 
 // Bytes returns the embedded TTF bytes for family's bold/italic variant.
-// It panics if family is not one of Sans, Serif, or Mono.
+// It panics if family is not one of Sans, Serif, Mono, or Carlito.
 func Bytes(family string, bold, italic bool) []byte {
 	switch family {
 	case Sans:

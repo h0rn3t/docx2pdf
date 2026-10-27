@@ -73,7 +73,7 @@ func TestLayoutTable_RowHeightFitsTallestCell(t *testing.T) {
 	}
 	tl := layoutTable(&fakeRenderer{}, tbl, contentWidthPt, contentHeightPt)
 
-	if got := len(tl.rows[0].cells[0].content.paragraphs[0].lines); got < 2 {
+	if got := len(tl.rows[0].cells[0].content.items[0].para.lines); got < 2 {
 		t.Fatalf("expected the narrow cell to wrap into multiple lines, got %d", got)
 	}
 	shortBoxHeight := tl.rows[0].cells[1].content.height

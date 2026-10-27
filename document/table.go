@@ -14,15 +14,35 @@ type paraBox struct {
 	shading string
 }
 
-// cellContent is a cell's laid-out paragraphs and (if any) its nested table,
-// plus the space they need: height along the cell's stacking direction, and
-// length (the widest unwrapped line) - which is what a vertical cell needs, its
-// text running along the row's height.
+// cellContent is a cell's laid-out paragraphs and nested tables in document
+// order, plus the space they need: height along the cell's stacking direction,
+// and length (the widest unwrapped line) - which is what a vertical cell needs,
+// its text running along the row's height.
 type cellContent struct {
-	paragraphs []paraBox
-	nested     *tableLayout
-	height     float64
-	length     float64
+	items  []cellItem
+	height float64
+	length float64
+}
+
+// cellItem is one laid-out block of a cell: exactly one field is non-nil.
+type cellItem struct {
+	para  *paraBox
+	table *tableLayout
+}
+
+// blocks is the cell's content in document order (see Cell.Content).
+func (c Cell) blocks() []BodyElement {
+	if len(c.Content) > 0 {
+		return c.Content
+	}
+	out := make([]BodyElement, 0, len(c.Paragraphs)+1)
+	for i := range c.Paragraphs {
+		out = append(out, BodyElement{Paragraph: &c.Paragraphs[i]})
+	}
+	if c.Nested != nil {
+		out = append(out, BodyElement{Table: c.Nested})
+	}
+	return out
 }
 
 // cellLayout pairs a cell with its laid-out content, its starting column index
@@ -143,14 +163,7 @@ func growMergedRows(tl *tableLayout) {
 			if cl.cell.VMerge != VMergeRestart {
 				continue
 			}
-			last := ri
-			for rj := ri + 1; rj < len(tl.rows); rj++ {
-				c, ok := tl.rows[rj].cellAt(cl.col)
-				if !ok || c.cell.VMerge != VMergeContinue {
-					break
-				}
-				last = rj
-			}
+			last := tl.mergeEnd(ri, cl.col) - 1
 			var have, flexible float64
 			var grow []int
 			for rj := ri; rj <= last; rj++ {
@@ -189,8 +202,8 @@ func cellHeightNeeded(cell Cell, m CellMargins, content cellContent) float64 {
 	return content.height + m.TopPt + m.BottomPt
 }
 
-// layoutCellContent lays out cell's paragraphs (stacked) and, if present, its
-// nested table, inside the cell's width minus its margins. A vertical cell's
+// layoutCellContent lays out cell's paragraphs and nested tables, stacked in
+// document order, inside the cell's width minus its margins. A vertical cell's
 // lines run along the row's height instead, so they are wrapped at wrapLen (the
 // row's declared height, or the room the frame has left) rather than at the
 // cell's width.
@@ -201,16 +214,23 @@ func layoutCellContent(r renderer, cell Cell, m CellMargins, width, wrapLen, ava
 	}
 
 	var cc cellContent
-	for _, p := range cell.Paragraphs {
+	for _, el := range cell.blocks() {
+		if el.Table != nil {
+			nt := layoutTable(r, *el.Table, inner, availHeight)
+			cc.items = append(cc.items, cellItem{table: &nt})
+			cc.height += nt.totalHeight
+			continue
+		}
+		p := *el.Paragraph
 		innerWidth := inner - p.Props.Indent.LeftPt - p.Props.Indent.RightPt
 		lines := layoutParagraph(r, p, innerWidth)
-		cc.paragraphs = append(cc.paragraphs, paraBox{
+		cc.items = append(cc.items, cellItem{para: &paraBox{
 			lines:   lines,
 			align:   p.Props.Alignment,
 			indent:  p.Props.Indent,
 			spacing: p.Props.Spacing,
 			shading: p.Props.Shading,
-		})
+		}})
 		if len(lines) == 0 {
 			cc.height += lineHeightFor(defaultRenderSizePt, 0, p.Props.Spacing)
 			continue
@@ -219,11 +239,6 @@ func layoutCellContent(r renderer, cell Cell, m CellMargins, width, wrapLen, ava
 			cc.height += ln.height
 			cc.length = math.Max(cc.length, ln.natural+p.Props.Indent.LeftPt+p.Props.Indent.RightPt)
 		}
-	}
-	if cell.Nested != nil {
-		nt := layoutTable(r, *cell.Nested, inner, availHeight)
-		cc.nested = &nt
-		cc.height += nt.totalHeight
 	}
 	return cc
 }
@@ -428,19 +443,67 @@ func (rl rowLayout) cellAt(col int) (cellLayout, bool) {
 	return cellLayout{}, false
 }
 
-// mergedHeight returns the total height a vMerge-restart cell at row ri,
-// column col draws across: its own row plus every immediately-following row
-// that continues the merge at that column.
-func (tl tableLayout) mergedHeight(ri, col int) float64 {
-	h := tl.rows[ri].height
-	for rj := ri + 1; rj < len(tl.rows); rj++ {
-		cl, ok := tl.rows[rj].cellAt(col)
+// mergeEnd returns the row index just past the vertical merge that the cell at
+// row ri, column col starts: ri+1 plus every immediately-following row that
+// continues the merge at that column.
+func (tl tableLayout) mergeEnd(ri, col int) int {
+	end := ri + 1
+	for end < len(tl.rows) {
+		cl, ok := tl.rows[end].cellAt(col)
 		if !ok || cl.cell.VMerge != VMergeContinue {
 			break
 		}
-		h += tl.rows[rj].height
+		end++
+	}
+	return end
+}
+
+// mergeStart returns the row of the restart cell whose merge the continuation
+// cell at row ri, column col belongs to.
+func (tl tableLayout) mergeStart(ri, col int) (int, bool) {
+	for rj := ri - 1; rj >= 0; rj-- {
+		cl, ok := tl.rows[rj].cellAt(col)
+		if !ok {
+			return 0, false
+		}
+		switch cl.cell.VMerge {
+		case VMergeRestart:
+			return rj, true
+		case VMergeNone:
+			return 0, false
+		case VMergeContinue: // keep walking up
+		}
+	}
+	return 0, false
+}
+
+// blockEnd returns the row index just past the rows that must share a page with
+// row ri: every row a vertical merge starting in the block reaches.
+func (tl tableLayout) blockEnd(ri int) int {
+	end := ri + 1
+	for k := ri; k < end; k++ {
+		for _, cl := range tl.rows[k].cells {
+			if cl.cell.VMerge == VMergeRestart {
+				end = max(end, tl.mergeEnd(k, cl.col))
+			}
+		}
+	}
+	return end
+}
+
+// rowsHeight is the total height of rows [from, to).
+func (tl tableLayout) rowsHeight(from, to int) float64 {
+	var h float64
+	for _, rl := range tl.rows[from:to] {
+		h += rl.height
 	}
 	return h
+}
+
+// mergedHeight returns the total height a vMerge-restart cell at row ri,
+// column col draws across: its own row plus every row continuing the merge.
+func (tl tableLayout) mergedHeight(ri, col int) float64 {
+	return tl.rowsHeight(ri, tl.mergeEnd(ri, col))
 }
 
 func colSpan(cell Cell) int {
@@ -460,10 +523,13 @@ func spanWidth(colWidths []float64, col, span int) float64 {
 
 // renderTable lays out t and draws it down the flow's current column, moving to
 // the next column or page before any row that would cross the bottom margin (a
-// row is never split). The table's leading header rows (w:tblHeader) are redrawn
-// at the top of every frame the table continues into. A floating table
-// (w:tblpPr) is drawn at its own position instead and leaves the cursor where it
-// was, since it is not part of the text flow.
+// row is never split). Rows joined by a vertical merge move on together when
+// they fit a fresh frame; a merge taller than that is cut at the bottom margin
+// and its box carries on at the top of the next frame. The table's leading
+// header rows (w:tblHeader) are redrawn at the top of every frame the table
+// continues into. A floating table (w:tblpPr) is drawn at its own position
+// instead and leaves the cursor where it was, since it is not part of the text
+// flow.
 func renderTable(f *flow, t Table) {
 	fr := f.frame()
 	tl := layoutTable(f.r, t, fr.contentWidth, fr.bottomLimit-fr.originY)
@@ -472,17 +538,33 @@ func renderTable(f *flow, t Table) {
 		drawTableRows(f.r, tl, x, y)
 		return
 	}
-	for ri := range tl.rows {
-		rh := tl.rows[ri].height
-		if f.y+rh > f.frame().bottomLimit && !f.atTop {
-			f.breakFrame()
-			if ri >= tl.headerRows { // the header rows themselves are not repeated above themselves
-				drawHeaderRows(f, tl)
-			}
+	frameStart := -1 // the first row drawn on a frame the table broke onto
+	drawn := make(map[[2]int]float64)
+	nextFrame := func(ri int) {
+		f.breakFrame()
+		if ri >= tl.headerRows { // the header rows themselves are not repeated above themselves
+			drawHeaderRows(f, tl)
 		}
-		drawRow(f.r, tl, ri, f.frame().originX, f.y)
-		f.y += rh
-		f.atTop = false
+		frameStart = ri
+	}
+	for ri := 0; ri < len(tl.rows); {
+		end := tl.blockEnd(ri)
+		room := f.frame().bottomLimit - pageFrom(f.sec.sec.Geometry).originY
+		if ri >= tl.headerRows {
+			room -= tl.rowsHeight(0, min(tl.headerRows, len(tl.rows)))
+		}
+		if h := tl.rowsHeight(ri, end); f.y+h > f.frame().bottomLimit && !f.atTop && h <= room {
+			nextFrame(ri)
+		}
+		for ; ri < end; ri++ {
+			rh := tl.rows[ri].height
+			if ri != frameStart && f.y+rh > f.frame().bottomLimit && !f.atTop {
+				nextFrame(ri)
+			}
+			drawRow(f.r, tl, ri, f.frame().originX, f.y, &pageCut{bottom: f.frame().bottomLimit, frameStart: ri == frameStart, drawn: drawn})
+			f.y += rh
+			f.atTop = false
+		}
 	}
 }
 
@@ -538,25 +620,130 @@ func floatOrigin(f *flow, fl TableFloat, tl tableLayout) (float64, float64) {
 // past them.
 func drawHeaderRows(f *flow, tl tableLayout) {
 	for ri := 0; ri < tl.headerRows && ri < len(tl.rows); ri++ {
-		drawRow(f.r, tl, ri, f.frame().originX, f.y)
+		drawRow(f.r, tl, ri, f.frame().originX, f.y, nil)
 		f.y += tl.rows[ri].height
 		f.atTop = false
 	}
 }
 
-// drawRow draws every non-continuation cell of row ri; vMerge-continue cells
-// are skipped since their area was already drawn by the restart cell above them.
-func drawRow(r renderer, tl tableLayout, ri int, x0, y float64) {
+// pageCut is what drawRow needs to fit a row onto a frame the table is
+// paginated across: the frame's lower limit, whether the row opens a frame the
+// table broke onto, and - per vertical merge, keyed by its restart row and
+// column - how far earlier frames already drew the merged cell's content.
+type pageCut struct {
+	bottom     float64
+	frameStart bool
+	drawn      map[[2]int]float64
+}
+
+// window picks the part of cl's content a box of the given height draws on this
+// frame: from where the previous frame stopped, to the last whole line that fits
+// when the cell is cut again here (more), else to the end. It records where it
+// stopped. Vertical text is not split: it is drawn (clipped) on the first frame
+// only.
+func (c *pageCut) window(cl cellLayout, key [2]int, height float64, more bool) contentWindow {
+	from := c.drawn[key]
+	if cl.cell.TextDirection != TextDirectionHorizontal {
+		c.drawn[key] = math.Inf(1)
+		if from > 0 {
+			return contentWindow{from: math.Inf(1), to: math.Inf(1)}
+		}
+		return wholeContent
+	}
+	to := math.Inf(1)
+	if more {
+		to = cl.content.breakAt(from, from+height-cl.margins.TopPt-cl.margins.BottomPt)
+	}
+	c.drawn[key] = to
+	return contentWindow{from: from, to: to}
+}
+
+// drawRow draws every non-continuation cell of row ri, a merged cell across all
+// the rows it spans. With a cut, nothing goes below the frame's limit: a merged
+// cell reaching past it is cut at its last whole line, and on the frame the
+// table continues onto, the first row draws the rest of that cell - its box and
+// the lines still to come. vMerge-continue cells are otherwise skipped, since
+// the restart cell above them drew their area. A nil cut draws unbounded.
+func drawRow(r renderer, tl tableLayout, ri int, x0, y float64, cut *pageCut) {
 	row := tl.rows[ri]
 	for _, cl := range row.cells {
+		x := x0 + tl.colOffsets[cl.col]
 		if cl.cell.VMerge == VMergeContinue {
+			if cut == nil || !cut.frameStart {
+				continue
+			}
+			start, ok := tl.mergeStart(ri, cl.col)
+			if !ok {
+				continue
+			}
+			rc, _ := tl.rows[start].cellAt(cl.col)
+			rest := tl.mergedHeight(start, cl.col) - tl.rowsHeight(start, ri)
+			height := min(rest, cut.bottom-y)
+			win := cut.window(rc, [2]int{start, cl.col}, height, rest > height)
+			drawCellBox(r, rc, x, y, spanWidth(tl.colWidths, cl.col, colSpan(rc.cell)), height, true, win)
 			continue
 		}
 		width := spanWidth(tl.colWidths, cl.col, colSpan(cl.cell))
-		height := tl.mergedHeight(ri, cl.col)
-		x := x0 + tl.colOffsets[cl.col]
-		drawCellBox(r, cl, x, y, width, height, row.fixed)
+		height, clip, win := tl.mergedHeight(ri, cl.col), row.fixed, wholeContent
+		if cut != nil && y+height > cut.bottom {
+			height, clip = cut.bottom-y, true
+			win = cut.window(cl, [2]int{ri, cl.col}, height, true)
+		}
+		drawCellBox(r, cl, x, y, width, height, clip, win)
 	}
+}
+
+// contentWindow is the slice of a cell's content a box draws, in content
+// coordinates (0 is the top of its first line): the units - lines, empty
+// paragraphs, nested tables - lying wholly within [from, to].
+type contentWindow struct{ from, to float64 }
+
+// wholeContent draws all of a cell's content.
+var wholeContent = contentWindow{to: math.Inf(1)}
+
+// unitBottoms lists the content-relative bottom of each unit a cell's content
+// can be cut after, in order.
+func (c cellContent) unitBottoms() []float64 {
+	var out []float64
+	var y float64
+	for _, it := range c.items {
+		switch {
+		case it.table != nil:
+			y += it.table.totalHeight
+			out = append(out, y)
+		case len(it.para.lines) == 0:
+			y += lineHeightFor(defaultRenderSizePt, 0, it.para.spacing)
+			out = append(out, y)
+		default:
+			for _, ln := range it.para.lines {
+				y += ln.height
+				out = append(out, y)
+			}
+		}
+	}
+	return out
+}
+
+// breakAt returns where to cut content that has been drawn up to from so that
+// what is drawn next ends by limit: the bottom of the last unit that fits. When
+// not even one more unit fits, it takes that unit anyway (to be clipped) so the
+// content always moves on.
+func (c cellContent) breakAt(from, limit float64) float64 {
+	const eps = 1e-6
+	cut := from
+	for _, b := range c.unitBottoms() {
+		if b <= from+eps {
+			continue
+		}
+		if b > limit+eps {
+			if cut == from {
+				return b
+			}
+			return cut
+		}
+		cut = b
+	}
+	return cut
 }
 
 // drawCellBox draws one cell's shading, borders and content within the rectangle
@@ -566,7 +753,8 @@ func drawRow(r renderer, tl tableLayout, ri int, x0, y float64) {
 // top (btLr) or top-to-bottom (tbRl). In a row of exact height (w:hRule="exact")
 // the content is clipped to the cell, as Word clips it, instead of spilling over
 // the row below.
-func drawCellBox(r renderer, cl cellLayout, x, y, width, height float64, clip bool) {
+// win picks the part of the content drawn here (see contentWindow).
+func drawCellBox(r renderer, cl cellLayout, x, y, width, height float64, clip bool, win contentWindow) {
 	if cl.cell.Shading != "" {
 		r.FillRect(x, y, width, height, cl.cell.Shading)
 	}
@@ -581,48 +769,63 @@ func drawCellBox(r renderer, cl cellLayout, x, y, width, height float64, clip bo
 		// Rotating counter-clockwise about the bottom-left corner turns a box that
 		// runs right-and-down from there into the cell's own rectangle.
 		r.Rotate(90, x, y+height)
-		drawCellContent(r, cl, x, y+height, height, width)
+		drawCellContent(r, cl, x, y+height, height, width, win)
 		r.RotateEnd()
 	case TextDirectionTBRL:
 		r.Rotate(-90, x+width, y)
-		drawCellContent(r, cl, x+width, y, height, width)
+		drawCellContent(r, cl, x+width, y, height, width, win)
 		r.RotateEnd()
 	default:
-		drawCellContent(r, cl, x, y, width, height)
+		drawCellContent(r, cl, x, y, width, height, win)
 	}
 }
 
-// drawCellContent draws a cell's paragraphs and nested table inside the box at
-// (x, y) of the given size, inset by the cell's margins and pushed down by the
-// cell's vertical alignment (w:vAlign) when the content is shorter than the box.
-func drawCellContent(r renderer, cl cellLayout, x, y, width, height float64) {
+// drawCellContent draws the window win of a cell's paragraphs and nested tables
+// inside the box at (x, y) of the given size, inset by the cell's margins. Whole
+// content is pushed down by the cell's vertical alignment (w:vAlign) when it is
+// shorter than the box; a window of content split across frames starts at the
+// top.
+func drawCellContent(r renderer, cl cellLayout, x, y, width, height float64, win contentWindow) {
+	const eps = 1e-6
 	m := cl.margins
-	cy := y + m.TopPt
-	if free := height - m.TopPt - m.BottomPt - cl.content.height; free > 0 {
-		switch cl.cell.VAlign {
-		case VAlignCenter:
-			cy += free / 2
-		case VAlignBottom:
-			cy += free
+	top := y + m.TopPt - win.from // page y of content-relative 0
+	if win == wholeContent {
+		if free := height - m.TopPt - m.BottomPt - cl.content.height; free > 0 {
+			switch cl.cell.VAlign {
+			case VAlignCenter:
+				top += free / 2
+			case VAlignBottom:
+				top += free
+			case VAlignTop:
+			}
 		}
 	}
-	for _, pb := range cl.content.paragraphs {
+	visible := func(from, to float64) bool { return from >= win.from-eps && to <= win.to+eps }
+	var pos float64 // content-relative top of the next unit
+	for _, it := range cl.content.items {
+		if it.table != nil {
+			if visible(pos, pos+it.table.totalHeight) {
+				drawTableRows(r, *it.table, x+m.LeftPt, top+pos)
+			}
+			pos += it.table.totalHeight
+			continue
+		}
+		pb := it.para
 		if len(pb.lines) == 0 {
-			cy += lineHeightFor(defaultRenderSizePt, 0, pb.spacing)
+			pos += lineHeightFor(defaultRenderSizePt, 0, pb.spacing)
 			continue
 		}
 		innerX := x + m.LeftPt + pb.indent.LeftPt
 		innerWidth := width - m.LeftPt - m.RightPt - pb.indent.LeftPt - pb.indent.RightPt
 		for i, ln := range pb.lines {
-			if pb.shading != "" { // paragraph shading sits over the cell's, under the text
-				r.FillRect(innerX, cy, innerWidth, ln.height, pb.shading)
+			if visible(pos, pos+ln.height) {
+				if pb.shading != "" { // paragraph shading sits over the cell's, under the text
+					r.FillRect(innerX, top+pos, innerWidth, ln.height, pb.shading)
+				}
+				drawLine(r, ln, pb.align, innerX, innerWidth, top+pos, i == len(pb.lines)-1, pb.indent.FirstLineOffsetPt, i == 0)
 			}
-			drawLine(r, ln, pb.align, innerX, innerWidth, cy, i == len(pb.lines)-1, pb.indent.FirstLineOffsetPt, i == 0)
-			cy += ln.height
+			pos += ln.height
 		}
-	}
-	if cl.content.nested != nil {
-		drawTableRows(r, *cl.content.nested, x+m.LeftPt, cy)
 	}
 }
 
@@ -632,7 +835,7 @@ func drawCellContent(r renderer, cl cellLayout, x, y, width, height float64) {
 func drawTableRows(r renderer, tl tableLayout, x, y float64) {
 	cy := y
 	for ri := range tl.rows {
-		drawRow(r, tl, ri, x, cy)
+		drawRow(r, tl, ri, x, cy, nil)
 		cy += tl.rows[ri].height
 	}
 }

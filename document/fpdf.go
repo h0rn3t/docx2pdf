@@ -16,9 +16,10 @@ import (
 // non-Latin scripts render as correct glyphs instead of PDF-core-font mojibake.
 type fpdfRenderer struct {
 	pdf *fpdf.Fpdf
-	// embedded tracks which Image.Name values are already registered with the
-	// backend, so a picture drawn on many pages is embedded once.
-	embedded map[string]bool
+	// images records, per Image.Name, whether the picture is registered with
+	// the backend (true) or was rejected by it (false), so a picture drawn on
+	// many pages is embedded - or turned down - once.
+	images map[string]bool
 }
 
 // utf8Styles are the style strings each embedded family is registered under,
@@ -50,7 +51,7 @@ func newFPDFRenderer(widthPt, heightPt float64) *fpdfRenderer {
 		}
 	}
 	pdf.SetFont(fonts.Sans, "", defaultRenderSizePt) // a font must be set before any text op
-	return &fpdfRenderer{pdf: pdf, embedded: make(map[string]bool)}
+	return &fpdfRenderer{pdf: pdf, images: make(map[string]bool)}
 }
 
 // defaultRenderSizePt is only the backend's initial font size; every run resets
@@ -96,17 +97,27 @@ func (r *fpdfRenderer) DrawText(x, y float64, s string) {
 }
 
 // DrawImage embeds img (once, keyed by its media part name) and draws it in the
-// given rectangle. An image the backend rejects (a corrupt or mislabeled blob)
-// leaves the fpdf error set, which Output reports.
+// given rectangle. A picture the backend cannot parse (say a PNG corrupt past
+// its header) is skipped: fpdf's error is sticky, so registering it on the real
+// document would fail the whole PDF over one picture. It is therefore tried on
+// a throwaway document first.
 func (r *fpdfRenderer) DrawImage(x, y, w, h float64, img *Image) {
 	if img == nil || w <= 0 || h <= 0 {
 		return
 	}
-	if !r.embedded[img.Name] {
-		r.pdf.RegisterImageOptionsReader(img.Name, fpdf.ImageOptions{ImageType: img.Type}, bytes.NewReader(img.Data))
-		r.embedded[img.Name] = true
+	opts := fpdf.ImageOptions{ImageType: img.Type}
+	ok, seen := r.images[img.Name]
+	if !seen {
+		probe := fpdf.New("P", "pt", "A4", "")
+		probe.RegisterImageOptionsReader(img.Name, opts, bytes.NewReader(img.Data))
+		if ok = probe.Error() == nil; ok {
+			r.pdf.RegisterImageOptionsReader(img.Name, opts, bytes.NewReader(img.Data))
+		}
+		r.images[img.Name] = ok
 	}
-	r.pdf.ImageOptions(img.Name, x, y, w, h, false, fpdf.ImageOptions{ImageType: img.Type}, 0, "")
+	if ok {
+		r.pdf.ImageOptions(img.Name, x, y, w, h, false, opts, 0, "")
+	}
 }
 
 func (r *fpdfRenderer) FillRect(x, y, w, h float64, colorHex string) {
@@ -174,19 +185,23 @@ func parseHexColor(hex string) (r, g, b int, ok bool) {
 // deliberately not used: it lacks Cyrillic glyphs, so it would render Cyrillic
 // text as blank boxes. The Calibri case comes first because Carlito is sans by
 // shape and would otherwise fall into the default Liberation Sans branch.
+// Monospace is checked before serif, and an explicit "sans" before the serif
+// list, so "DejaVu Sans Mono" stays monospace and "Microsoft Sans Serif" stays
+// sans even though its name contains "serif".
 func mapFontFamily(name string) string {
 	n := strings.ToLower(name)
 	switch {
 	case strings.Contains(n, "calibri"):
 		return fonts.Carlito
+	case containsAny(n, "courier", "mono", "consol", "menlo", "code", "monaco", "lucida console",
+		"cascadia", "andale", "jetbrains", "inconsolata", "sfmono"):
+		return fonts.Mono
+	case strings.Contains(n, "sans"):
+		return fonts.Sans
 	case containsAny(n, "times", "serif", "georgia", "garamond", "roman", "cambria", "minion", "book",
 		"constantia", "palatino", "baskerville", "didot", "playfair", "merriweather", "cardo",
 		"goudy", "caslon", "bodoni", "rockwell", "perpetua"):
 		return fonts.Serif
-	case containsAny(n, "courier", "mono", "consol", "menlo", "code", "monaco", "lucida console",
-		"source code", "fira", "cascadia", "andale", "dejavu sans mono", "ubuntu mono",
-		"jetbrains", "inconsolata", "sfmono", "sf mono"):
-		return fonts.Mono
 	default:
 		return fonts.Sans
 	}
