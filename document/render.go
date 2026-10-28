@@ -148,7 +148,7 @@ func setPageNumber(r renderer, ln *line, pageNo int) {
 			continue
 		}
 		w.text = strconv.Itoa(pageNo)
-		r.SetFont(w.props.FontFamily, w.props.Bold, w.props.Italic, w.props.Underline, w.props.SizePt)
+		r.SetFont(w.props.FontFamily, w.props.Bold, w.props.Italic, w.props.Underline, w.props.Strike, w.props.SizePt)
 		width := r.TextWidth(w.text)
 		ln.natural += width - w.width
 		w.width = width
@@ -406,6 +406,7 @@ func (c *Converter) renderPass(r renderer, numPages int) {
 			f.startSection(secs[si])
 			balanceSection(f, secs, si, c.doc.Body)
 		}
+		keepTogether(f, c.doc.Body, i)
 		renderElement(f, el)
 	}
 	if len(c.doc.Endnotes) > 0 {
@@ -556,6 +557,57 @@ func (c *Converter) sections() []sectionLayout {
 		out[i] = layoutSection(s)
 	}
 	return out
+}
+
+// keepTogether moves the flow on to the next frame when body[i] starts a block
+// Word keeps in one piece - a paragraph whose lines are kept together, or a run
+// of paragraphs each kept with the next, up to the first line of the element
+// that ends the run - and the block fits a fresh frame but not what is left of
+// this one.
+func keepTogether(f *flow, body []BodyElement, i int) {
+	start := body[i].Paragraph
+	if f.atTop || start == nil || !start.Props.KeepNext && !start.Props.KeepLines {
+		return
+	}
+	width := f.frame().contentWidth
+	var h float64
+	for j := i; j < len(body); j++ {
+		el := body[j]
+		if el.Table != nil {
+			if tl := layoutTable(f.r, *el.Table, width, math.Inf(1)); len(tl.rows) > 0 {
+				h += tl.rows[0].height
+			}
+			break
+		}
+		p := el.Paragraph
+		if j > i && (p.Props.PageBreak || p.Props.ColumnBreak) {
+			break
+		}
+		if j == i || p.Props.KeepNext {
+			h += blockHeight(f.r, body[j:j+1], width)
+			if !p.Props.KeepNext {
+				h -= p.Props.Spacing.AfterPt // may fall past the foot of the frame
+			}
+		} else {
+			h += p.Props.Spacing.BeforePt + firstLineHeight(f.r, *p, width)
+		}
+		if !p.Props.KeepNext {
+			break
+		}
+	}
+	fr := f.frame()
+	if h <= fr.bottomLimit-fr.originY && f.y+h > fr.bottomLimit {
+		f.breakFrame()
+	}
+}
+
+// firstLineHeight is the height of p's first line at width.
+func firstLineHeight(r renderer, p Paragraph, width float64) float64 {
+	lines := layoutParagraph(r, p, width-p.Props.Indent.LeftPt-p.Props.Indent.RightPt)
+	if len(lines) == 0 {
+		return lineHeightFor(defaultRenderSizePt, 0, p.Props.Spacing)
+	}
+	return lines[0].height
 }
 
 func renderElement(f *flow, el BodyElement) {

@@ -14,6 +14,7 @@ import (
 	"io/fs"
 	"net/url"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -377,11 +378,65 @@ func emuToPt(s string) float64 {
 
 type xmlPict struct {
 	Shape *xmlVShape `xml:"urn:schemas-microsoft-com:vml shape"`
+	// Other holds the text boxes of the picture's other shapes (v:rect,
+	// v:roundrect, v:group, …).
+	Other []xmlTextBoxes `xml:",any"`
 }
 
 type xmlVShape struct {
 	Style     string        `xml:"style,attr"`
 	ImageData *xmlImageData `xml:"urn:schemas-microsoft-com:vml imagedata"`
+	// TextBox holds the shape's v:textbox content.
+	TextBox []xmlTextBoxes `xml:",any"`
+}
+
+// xmlTextBoxes collects the content of every text box (w:txbxContent) inside
+// the element it decodes, at any depth: a DrawingML shape's wps:txbx, the
+// shapes of a group, a VML shape's v:textbox.
+type xmlTextBoxes struct {
+	Blocks []xmlBodyChild
+}
+
+func (tb *xmlTextBoxes) UnmarshalXML(d *xml.Decoder, _ xml.StartElement) error {
+	for {
+		tok, err := d.Token()
+		if err != nil {
+			return err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if t.Name.Space == wordNS && t.Name.Local == "txbxContent" {
+				err = decodeBlocks(d, &tb.Blocks, skipAll)
+			} else {
+				err = tb.UnmarshalXML(d, t)
+			}
+			if err != nil {
+				return err
+			}
+		case xml.EndElement:
+			return nil
+		}
+	}
+}
+
+// textBoxes is the content of the picture's text boxes, in document order.
+func (p *xmlPict) textBoxes() []xmlBodyChild {
+	var blocks []xmlBodyChild
+	if p.Shape != nil {
+		for _, tb := range p.Shape.TextBox {
+			blocks = append(blocks, tb.Blocks...)
+		}
+	}
+	for _, tb := range p.Other {
+		blocks = append(blocks, tb.Blocks...)
+	}
+	return blocks
+}
+
+// shows reports whether the picture draws anything this package renders: an
+// image or a text box.
+func (p *xmlPict) shows() bool {
+	return p.Shape != nil && p.Shape.ImageData != nil || len(p.textBoxes()) > 0
 }
 
 type xmlImageData struct {
@@ -532,10 +587,12 @@ type xmlGraphic struct {
 	Data xmlGraphicData `xml:"http://schemas.openxmlformats.org/drawingml/2006/main graphicData"`
 }
 
-// xmlGraphicData holds the graphic's payload; only a picture (pic:pic) is
-// modeled, so charts, diagrams and shapes decode to a nil Pic and are skipped.
+// xmlGraphicData holds the graphic's payload: a picture (pic:pic), or the text
+// boxes of a shape or group of shapes. Charts and diagrams decode to neither and
+// are skipped.
 type xmlGraphicData struct {
-	Pic *xmlPic `xml:"http://schemas.openxmlformats.org/drawingml/2006/picture pic"`
+	Pic    *xmlPic        `xml:"http://schemas.openxmlformats.org/drawingml/2006/picture pic"`
+	Shapes []xmlTextBoxes `xml:",any"`
 }
 
 type xmlPic struct {
@@ -632,6 +689,28 @@ func (d *xmlDrawing) image(ir *imageResolver) *Image {
 		}
 	}
 	return nil
+}
+
+// textBoxes is the content of the drawing's text boxes, in document order.
+func (d *xmlDrawing) textBoxes() []xmlBodyChild {
+	var blocks []xmlBodyChild
+	for _, a := range slices.Concat(d.Inline, d.Anchor) {
+		for _, tb := range a.Graphic.Data.Shapes {
+			blocks = append(blocks, tb.Blocks...)
+		}
+	}
+	return blocks
+}
+
+// shows reports whether the drawing draws anything this package renders: a
+// picture or a text box.
+func (d *xmlDrawing) shows() bool {
+	for _, a := range slices.Concat(d.Inline, d.Anchor) {
+		if a.Graphic.Data.Pic != nil {
+			return true
+		}
+	}
+	return len(d.textBoxes()) > 0
 }
 
 func (a xmlAnchor) picture(ir *imageResolver) *Image {

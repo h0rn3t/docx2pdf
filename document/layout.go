@@ -274,7 +274,7 @@ func segmentWidths(r renderer, words []word) (whole, toDecimal float64) {
 			break
 		}
 		if i := decimalSeparator(x.text); toDecimal < 0 && x.img == nil && i >= 0 {
-			r.SetFont(x.props.FontFamily, x.props.Bold, x.props.Italic, x.props.Underline, x.props.SizePt)
+			r.SetFont(x.props.FontFamily, x.props.Bold, x.props.Italic, x.props.Underline, x.props.Strike, x.props.SizePt)
 			toDecimal = whole + x.gap + r.TextWidth(x.text[:i])
 		}
 		whole += x.gap + x.width
@@ -388,7 +388,7 @@ func drawLine(r renderer, ln line, align Alignment, x0, width, y float64, isLast
 			drawLeader(r, w, placed[i], baseline)
 			continue
 		}
-		r.SetFont(w.props.FontFamily, w.props.Bold, w.props.Italic, w.props.Underline, w.props.SizePt)
+		r.SetFont(w.props.FontFamily, w.props.Bold, w.props.Italic, w.props.Underline, w.props.Strike, w.props.SizePt)
 		r.SetTextColor(w.props.Color)
 		r.DrawText(placed[i], baseline-w.props.BaselineShiftPt, w.text)
 	}
@@ -454,7 +454,7 @@ func drawLeader(r renderer, w word, x, baseline float64) {
 	if w.leader == "" {
 		return
 	}
-	r.SetFont(w.props.FontFamily, w.props.Bold, w.props.Italic, false, w.props.SizePt)
+	r.SetFont(w.props.FontFamily, w.props.Bold, w.props.Italic, false, false, w.props.SizePt)
 	r.SetTextColor(w.props.Color)
 	cw := r.TextWidth(w.leader)
 	if cw <= 0 {
@@ -521,7 +521,7 @@ func measureWords(r renderer, p Paragraph) []word {
 			continue
 		}
 		for i, tok := range tokenize(run.Text) {
-			r.SetFont(run.Props.FontFamily, run.Props.Bold, run.Props.Italic, run.Props.Underline, run.Props.SizePt)
+			r.SetFont(run.Props.FontFamily, run.Props.Bold, run.Props.Italic, run.Props.Underline, run.Props.Strike, run.Props.SizePt)
 			if tok.space {
 				pendingGap += r.TextWidth(tok.text)
 				continue

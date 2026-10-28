@@ -47,9 +47,9 @@ type realFace struct {
 }
 
 type fontRequest struct {
-	family                  string
-	bold, italic, underline bool
-	size                    float64
+	family                          string
+	bold, italic, underline, strike bool
+	size                            float64
 }
 
 // utf8Styles are the style strings each embedded family is registered under,
@@ -158,16 +158,13 @@ func (r *fpdfRenderer) covers(f *realFace, s string) bool {
 
 // selectFont makes the backend's font the one to draw s in: the requested
 // family's real font when there is one that has all of s's characters, else
-// its metric-compatible replacement.
-func (r *fpdfRenderer) selectFont(s string) {
+// its metric-compatible replacement. It returns the text to draw, which in a
+// replacement for a symbol font is s's Unicode stand-ins.
+func (r *fpdfRenderer) selectFont(s string) string {
 	c := r.cur
 	if f := r.face(c.family, c.bold, c.italic); f != nil && r.covers(f, s) {
-		style := ""
-		if c.underline {
-			style = "U"
-		}
-		r.pdf.SetFont(f.name, style, c.size)
-		return
+		r.pdf.SetFont(f.name, c.decoration(), c.size)
+		return s
 	}
 	var style strings.Builder
 	if c.bold {
@@ -176,18 +173,30 @@ func (r *fpdfRenderer) selectFont(s string) {
 	if c.italic {
 		style.WriteByte('I')
 	}
-	if c.underline {
-		style.WriteByte('U')
-	}
+	style.WriteString(c.decoration())
 	r.pdf.SetFont(mapFontFamily(c.family), style.String(), c.size)
+	return symbolText(c.family, s)
+}
+
+// decoration is fpdf's style letters for the request's underline ("U") and
+// strikethrough ("S").
+func (c fontRequest) decoration() string {
+	var s string
+	if c.underline {
+		s += "U"
+	}
+	if c.strike {
+		s += "S"
+	}
+	return s
 }
 
 // defaultRenderSizePt is only the backend's initial font size; every run resets
 // the font before it is measured or drawn.
 const defaultRenderSizePt = 11.0
 
-func (r *fpdfRenderer) SetFont(family string, bold, italic, underline bool, sizePt float64) {
-	r.cur = fontRequest{family: family, bold: bold, italic: italic, underline: underline, size: sizePt}
+func (r *fpdfRenderer) SetFont(family string, bold, italic, underline, strike bool, sizePt float64) {
+	r.cur = fontRequest{family: family, bold: bold, italic: italic, underline: underline, strike: strike, size: sizePt}
 }
 
 // SetTextColor sets the text fill color from a "#RRGGBB" string; an empty or
@@ -201,8 +210,7 @@ func (r *fpdfRenderer) SetTextColor(colorHex string) {
 }
 
 func (r *fpdfRenderer) TextWidth(s string) float64 {
-	r.selectFont(s)
-	return r.pdf.GetStringWidth(s)
+	return r.pdf.GetStringWidth(r.selectFont(s))
 }
 
 // AddPage starts a page of the requested size (each section brings its own, so
@@ -213,8 +221,7 @@ func (r *fpdfRenderer) AddPage(widthPt, heightPt float64) {
 
 func (r *fpdfRenderer) DrawText(x, y float64, s string) {
 	if s != "" {
-		r.selectFont(s)
-		r.pdf.Text(x, y, s)
+		r.pdf.Text(x, y, r.selectFont(s))
 	}
 }
 

@@ -93,7 +93,7 @@ type pageCall struct {
 	widthPt, heightPt float64
 }
 
-func (f *fakeRenderer) SetFont(_ string, bold, _, _ bool, sizePt float64) {
+func (f *fakeRenderer) SetFont(_ string, bold, _, _, _ bool, sizePt float64) {
 	f.bold, f.size = bold, sizePt
 }
 func (f *fakeRenderer) SetTextColor(colorHex string) { f.color = colorHex }

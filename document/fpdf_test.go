@@ -43,10 +43,33 @@ func TestMapFontFamily(t *testing.T) {
 	}
 }
 
+func TestStrikeDrawsALineThroughText(t *testing.T) {
+	// fpdf draws a strikethrough (like an underline) as a filled rectangle.
+	rects := func(underline, strike bool) int {
+		r := newFPDFRenderer(testGeometry.WidthPt, testGeometry.HeightPt, nil, nil)
+		r.pdf.SetCompression(false)
+		r.AddPage(testGeometry.WidthPt, testGeometry.HeightPt)
+		r.SetFont(fonts.Sans, false, false, underline, strike, 12)
+		r.DrawText(marginPt, 120, "hello")
+		var buf bytes.Buffer
+		if err := r.Output(&buf); err != nil {
+			t.Fatalf("Output: %v", err)
+		}
+		return bytes.Count(buf.Bytes(), []byte(" re f"))
+	}
+	plain := rects(false, false)
+	if got := rects(false, true); got != plain+1 {
+		t.Errorf("strike: %d filled rectangles, want %d", got, plain+1)
+	}
+	if got := rects(true, true); got != plain+2 {
+		t.Errorf("underline+strike: %d filled rectangles, want %d", got, plain+2)
+	}
+}
+
 func TestTrivialRenderEmitsPDF(t *testing.T) {
 	r := newFPDFRenderer(testGeometry.WidthPt, testGeometry.HeightPt, nil, nil)
 	r.AddPage(testGeometry.WidthPt, testGeometry.HeightPt)
-	r.SetFont(fonts.Sans, true, false, true, 12)
+	r.SetFont(fonts.Sans, true, false, true, false, 12)
 	r.DrawText(marginPt, 120, "hello")
 
 	var buf bytes.Buffer

@@ -10,6 +10,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // wordNS is the WordprocessingML namespace URI. Element struct tags match on
@@ -17,6 +19,10 @@ import (
 // correctly and elements in other namespaces are ignored by encoding/xml —
 // which is exactly the "skip unsupported content" behaviour we want.
 const wordNS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+// mcNS is the markup-compatibility namespace of mc:AlternateContent, which
+// offers newer content (mc:Choice) with an older equivalent (mc:Fallback).
+const mcNS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 
 type xmlDocument struct {
 	Body xmlBody `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main body"`
@@ -247,6 +253,11 @@ type xmlPPr struct {
 	NumPr           *xmlNumPr    `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main numPr"`
 	Shd             *xmlShd      `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main shd"`
 	Tabs            *xmlTabs     `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main tabs"`
+	// ContextualSpacing drops the space before/after the paragraph next to
+	// one of the same style.
+	ContextualSpacing *xmlOnOff `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main contextualSpacing"`
+	KeepNext          *xmlOnOff `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main keepNext"`
+	KeepLines         *xmlOnOff `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main keepLines"`
 	// SectPr is only meaningful on a body paragraph: it ends a section there.
 	SectPr *xmlSectPr `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main sectPr"`
 }
@@ -359,8 +370,8 @@ type xmlPSpacing struct {
 // xmlRun captures its rPr plus an ordered sequence of text, break and picture
 // children via a custom UnmarshalXML (encoding/xml's separate slices would lose
 // the document order of <w:t>, <w:br> and <w:drawing>, which matters for
-// in-paragraph line breaks and inline images). Unsupported run children (e.g.
-// <w:sym>) are skipped without error.
+// in-paragraph line breaks and inline images). Unsupported run children are
+// skipped without error.
 type xmlRun struct {
 	Props   *xmlRPr
 	Content []xmlRunContent
@@ -383,6 +394,15 @@ type xmlRunContent struct {
 	// w:footnoteRef/w:endnoteRef that shows a note's own number inside it.
 	NoteRef  *xmlNoteRef
 	NoteMark bool
+	// Sym is a <w:sym>: one character of a symbol font.
+	Sym *xmlSym
+}
+
+// xmlSym is <w:sym>: a character (w:char, a hex code - usually in the font's
+// private-use range U+F0xx) and the font it is drawn in (w:font).
+type xmlSym struct {
+	Font string `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main font,attr"`
+	Char string `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main char,attr"`
 }
 
 func (r *xmlRun) UnmarshalXML(d *xml.Decoder, _ xml.StartElement) error {
@@ -399,6 +419,14 @@ func (r *xmlRun) UnmarshalXML(d *xml.Decoder, _ xml.StartElement) error {
 			if _, end := tok.(xml.EndElement); end {
 				return nil // </w:r>: children were consumed by DecodeElement/Skip
 			}
+			continue
+		}
+		if start.Name.Space == mcNS && start.Name.Local == "AlternateContent" {
+			content, err := decodeAlternateContent(d)
+			if err != nil {
+				return err
+			}
+			r.Content = append(r.Content, content...)
 			continue
 		}
 		if start.Name.Space != wordNS {
@@ -449,6 +477,12 @@ func (r *xmlRun) UnmarshalXML(d *xml.Decoder, _ xml.StartElement) error {
 				return err
 			}
 			r.Content = append(r.Content, xmlRunContent{NoteMark: true})
+		case "sym":
+			var sym xmlSym
+			if err := d.DecodeElement(&sym, &start); err != nil {
+				return err
+			}
+			r.Content = append(r.Content, xmlRunContent{Sym: &sym})
 		case "noBreakHyphen":
 			if err := d.Skip(); err != nil {
 				return err
@@ -489,6 +523,51 @@ func (r *xmlRun) UnmarshalXML(d *xml.Decoder, _ xml.StartElement) error {
 	}
 }
 
+// decodeAlternateContent reads an mc:AlternateContent inside a run up to its
+// end tag and returns the run content to use: the first mc:Choice that shows
+// something - a text box shape Word 2010 writes, say - else the mc:Fallback,
+// usually the same as legacy VML.
+func decodeAlternateContent(d *xml.Decoder) ([]xmlRunContent, error) {
+	var choice, fallback []xmlRunContent
+	for {
+		tok, err := d.Token()
+		if err != nil {
+			return nil, err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			var x xmlRun
+			if err := x.UnmarshalXML(d, t); err != nil {
+				return nil, err
+			}
+			switch {
+			case t.Name.Space != mcNS:
+			case t.Name.Local == "Choice" && choice == nil && slices.ContainsFunc(x.Content, xmlRunContent.shows):
+				choice = x.Content
+			case t.Name.Local == "Fallback":
+				fallback = x.Content
+			}
+		case xml.EndElement:
+			if choice != nil {
+				return choice, nil
+			}
+			return fallback, nil
+		}
+	}
+}
+
+// shows reports whether the item draws something: anything but a drawing or a
+// picture that holds nothing this package renders.
+func (c xmlRunContent) shows() bool {
+	switch {
+	case c.Drawing != nil:
+		return c.Drawing.shows()
+	case c.Pict != nil:
+		return c.Pict.shows()
+	}
+	return true
+}
+
 type xmlRPr struct {
 	RStyle    *xmlVal    `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main rStyle"`
 	Bold      *xmlOnOff  `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main b"`
@@ -501,6 +580,11 @@ type xmlRPr struct {
 	Highlight *xmlVal    `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main highlight"`
 	VertAlign *xmlVal    `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main vertAlign"`
 	Position  *xmlVal    `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main position"`
+	Strike    *xmlOnOff  `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main strike"`
+	DStrike   *xmlOnOff  `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main dstrike"`
+	Caps      *xmlOnOff  `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main caps"`
+	SmallCaps *xmlOnOff  `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main smallCaps"`
+	Vanish    *xmlOnOff  `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main vanish"`
 }
 
 // xmlColor is <w:color>: an explicit sRGB hex value (w:val, or "auto") and/or a
@@ -585,6 +669,7 @@ type xmlTable struct {
 
 type xmlTblPr struct {
 	StyleID *xmlVal       `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main tblStyle"`
+	Jc      *xmlVal       `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main jc"`
 	Borders *xmlBorders   `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main tblBorders"`
 	Ind     *xmlTblInd    `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main tblInd"`
 	Look    *xmlTblLook   `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main tblLook"`
@@ -845,6 +930,7 @@ type resolvedTableStyle struct {
 	CellBorders *xmlBorders
 	Shd         *xmlShd
 	Ind         *xmlTblInd
+	Jc          *xmlVal
 	CellMar     *xmlTcMar
 	PPr         *xmlPPr
 	RPr         *xmlRPr
@@ -902,6 +988,7 @@ func resolveTableStyle(id string, defs map[string]xmlStyle, cache map[string]res
 	if def.TblPr != nil {
 		own.Borders = def.TblPr.Borders
 		own.Ind = def.TblPr.Ind
+		own.Jc = def.TblPr.Jc
 		own.CellMar = def.TblPr.CellMar
 	}
 	if def.TcPr != nil {
@@ -923,6 +1010,7 @@ func resolveTableStyle(id string, defs map[string]xmlStyle, cache map[string]res
 		CellBorders: mergeBorders(own.CellBorders, parent.CellBorders),
 		Shd:         coalesceShd(own.Shd, parent.Shd),
 		Ind:         coalesceTblInd(own.Ind, parent.Ind),
+		Jc:          coalesceVal(own.Jc, parent.Jc),
 		CellMar:     mergeTcMar(own.CellMar, parent.CellMar),
 		PPr:         mergePPr(own.PPr, parent.PPr),
 		RPr:         mergeRPr(own.RPr, parent.RPr),
@@ -1050,6 +1138,10 @@ func mergePPr(own, fallback *xmlPPr) *xmlPPr {
 		NumPr:   coalesceNumPr(o.NumPr, f.NumPr),
 		Shd:     coalesceShd(o.Shd, f.Shd),
 		Tabs:    mergeTabs(o.Tabs, f.Tabs),
+
+		ContextualSpacing: coalesceOnOff(o.ContextualSpacing, f.ContextualSpacing),
+		KeepNext:          coalesceOnOff(o.KeepNext, f.KeepNext),
+		KeepLines:         coalesceOnOff(o.KeepLines, f.KeepLines),
 	}
 }
 
@@ -1168,6 +1260,10 @@ type resolvedParaStyle struct {
 	Shd     *xmlShd
 	Tabs    *xmlTabs
 	RPr     *xmlRPr
+
+	ContextualSpacing *xmlOnOff
+	KeepNext          *xmlOnOff
+	KeepLines         *xmlOnOff
 }
 
 // buildParaStyles resolves every paragraph style declared in xs (nil-safe:
@@ -1212,6 +1308,9 @@ func resolveParaStyle(id string, defs map[string]xmlStyle, cache map[string]reso
 		own.NumPr = def.PPr.NumPr
 		own.Shd = def.PPr.Shd
 		own.Tabs = def.PPr.Tabs
+		own.ContextualSpacing = def.PPr.ContextualSpacing
+		own.KeepNext = def.PPr.KeepNext
+		own.KeepLines = def.PPr.KeepLines
 	}
 	own.RPr = def.RPr
 	var parent resolvedParaStyle
@@ -1226,6 +1325,10 @@ func resolveParaStyle(id string, defs map[string]xmlStyle, cache map[string]reso
 		Shd:     coalesceShd(own.Shd, parent.Shd),
 		Tabs:    mergeTabs(own.Tabs, parent.Tabs),
 		RPr:     mergeRPr(own.RPr, parent.RPr),
+
+		ContextualSpacing: coalesceOnOff(own.ContextualSpacing, parent.ContextualSpacing),
+		KeepNext:          coalesceOnOff(own.KeepNext, parent.KeepNext),
+		KeepLines:         coalesceOnOff(own.KeepLines, parent.KeepLines),
 	}
 	cache[id] = merged
 	return merged
@@ -1301,6 +1404,11 @@ func mergeRPr(own, fallback *xmlRPr) *xmlRPr {
 		Highlight: coalesceVal(o.Highlight, f.Highlight),
 		VertAlign: coalesceVal(o.VertAlign, f.VertAlign),
 		Position:  coalesceVal(o.Position, f.Position),
+		Strike:    coalesceOnOff(o.Strike, f.Strike),
+		DStrike:   coalesceOnOff(o.DStrike, f.DStrike),
+		Caps:      coalesceOnOff(o.Caps, f.Caps),
+		SmallCaps: coalesceOnOff(o.SmallCaps, f.SmallCaps),
+		Vanish:    coalesceOnOff(o.Vanish, f.Vanish),
 	}
 }
 
@@ -1434,20 +1542,98 @@ func (sc styleContext) underRPr() *xmlRPr {
 func buildBody(body xmlBody, sc styleContext) ([]BodyElement, []sectionBreak) {
 	elems := make([]BodyElement, 0, len(body.Children))
 	var breaks []sectionBreak
+	// prev is the paragraph just before the current one (nil after a table),
+	// with its style and w:contextualSpacing, for the spacing between the two.
+	var prev *Paragraph
+	var prevStyle string
+	var prevContextual bool
 	for _, c := range body.Children {
 		switch {
 		case c.Paragraph != nil:
 			p := buildParagraph(*c.Paragraph, sc)
+			style, contextual := contextualSpacing(c.Paragraph.Props, sc)
+			if prev != nil && style == prevStyle {
+				if prevContextual {
+					prev.Props.Spacing.AfterPt = 0
+				}
+				if contextual {
+					p.Props.Spacing.BeforePt = 0
+				}
+			}
+			prev, prevStyle, prevContextual = &p, style, contextual
 			elems = append(elems, BodyElement{Paragraph: &p})
+			// A text box's content follows the paragraph it is anchored in: it is
+			// laid out in the flow rather than in a frame of its own.
+			if boxes := c.Paragraph.textBoxes(); len(boxes) > 0 {
+				inner, _ := buildBody(xmlBody{Children: boxes}, sc)
+				elems = append(elems, inner...)
+				prev = nil
+			}
 			if c.Paragraph.Props != nil && c.Paragraph.Props.SectPr != nil {
 				breaks = append(breaks, sectionBreak{props: c.Paragraph.Props.SectPr, end: len(elems)})
 			}
 		case c.Table != nil:
 			t := buildTable(*c.Table, sc)
 			elems = append(elems, BodyElement{Table: &t})
+			prev = nil
 		}
 	}
 	return elems, breaks
+}
+
+// textBoxes is the content of the text boxes anchored in the paragraph's runs,
+// in document order.
+func (xp *xmlParagraph) textBoxes() []xmlBodyChild {
+	var blocks []xmlBodyChild
+	for _, item := range xp.Items {
+		var runs []xmlRun
+		switch {
+		case item.Run != nil:
+			runs = []xmlRun{*item.Run}
+		case item.Hyperlink != nil:
+			runs = item.Hyperlink.Runs
+		case item.FldSimple != nil:
+			runs = item.FldSimple.Runs
+		}
+		for _, r := range runs {
+			for _, c := range r.Content {
+				if c.Drawing != nil {
+					blocks = append(blocks, c.Drawing.textBoxes()...)
+				}
+				if c.Pict != nil {
+					blocks = append(blocks, c.Pict.textBoxes()...)
+				}
+			}
+		}
+	}
+	return blocks
+}
+
+// contextualSpacing returns a paragraph's style id and whether it drops its
+// space before/after next to a paragraph of that same style
+// (w:contextualSpacing: inline → paragraph style → table style → docDefaults).
+func contextualSpacing(pPr *xmlPPr, sc styleContext) (string, bool) {
+	var style string
+	if pPr != nil && pPr.PStyle != nil {
+		style = pPr.PStyle.Val
+	}
+	on := flagOn(pPr, sc.paragraphs[style].ContextualSpacing, sc.underPPr(),
+		func(pr *xmlPPr) *xmlOnOff { return pr.ContextualSpacing })
+	return style, on
+}
+
+// flagOn resolves an on/off paragraph property down its tiers: the paragraph's
+// own w:pPr (inline), its style's resolved value, then the tier beneath (the
+// table style inside a cell, over w:docDefaults). field picks the property out
+// of a w:pPr.
+func flagOn(inline *xmlPPr, style *xmlOnOff, under *xmlPPr, field func(*xmlPPr) *xmlOnOff) bool {
+	if inline != nil && field(inline) != nil {
+		return field(inline).on()
+	}
+	if style != nil {
+		return style.on()
+	}
+	return under != nil && field(under).on()
 }
 
 func buildParagraph(xp xmlParagraph, sc styleContext) Paragraph {
@@ -1514,6 +1700,9 @@ func buildParagraph(xp xmlParagraph, sc styleContext) Paragraph {
 	p.Props.Tabs = tabStopsFrom(tabs)
 	p.Props.DefaultTabStopPt = sc.defaultTabPt
 
+	p.Props.KeepNext = flagOn(inlinePPr, ps.KeepNext, under, func(pr *xmlPPr) *xmlOnOff { return pr.KeepNext })
+	p.Props.KeepLines = flagOn(inlinePPr, ps.KeepLines, under, func(pr *xmlPPr) *xmlOnOff { return pr.KeepLines })
+
 	// Numbering: prepend a marker run and (when the paragraph declared no
 	// indent) borrow the level's hanging indent.
 	if m, ok := resolveMarker(inlinePPr, ps, hasStyle, sc); ok {
@@ -1576,7 +1765,9 @@ type fieldState struct {
 // appendRun turns one <w:r> into paragraph runs, feeding its content through the
 // field state machine so PAGE/NUMPAGES fields become computed runs.
 func appendRun(p *Paragraph, xr xmlRun, pStyleRPr *xmlRPr, sc styleContext, fld *fieldState) {
-	props := resolveRunProps(xr.Props, pStyleRPr, sc)
+	rpr := runRPr(xr.Props, pStyleRPr, sc)
+	props := runPropsFrom(rpr, sc)
+	hidden := rpr != nil && rpr.Vanish.on()
 	for _, c := range xr.Content {
 		switch {
 		case c.FldChar != nil:
@@ -1605,6 +1796,9 @@ func appendRun(p *Paragraph, xr xmlRun, pStyleRPr *xmlRPr, sc styleContext, fld 
 			}
 		case fld.active && (fld.inInstr || fld.suppress):
 			// Instruction region, or a known field's cached result: draw nothing.
+		case hidden:
+			// Hidden text (w:vanish) is not printed. Its field characters above
+			// still count, since a field's code is often hidden but not its result.
 		case c.Break != nil:
 			atStart := len(p.Runs) == fld.lead
 			switch strings.ToLower(strings.TrimSpace(c.Break.Type)) {
@@ -1644,7 +1838,11 @@ func appendRun(p *Paragraph, xr xmlRun, pStyleRPr *xmlRPr, sc styleContext, fld 
 		case c.NoteMark && sc.noteMark != "":
 			p.Runs = append(p.Runs, Run{Text: sc.noteMark, Props: noteMarkProps(props)})
 		case c.Text != nil && *c.Text != "":
-			p.Runs = append(p.Runs, Run{Text: *c.Text, Props: props})
+			p.Runs = append(p.Runs, casedRuns(*c.Text, rpr, props)...)
+		case c.Sym != nil:
+			if run, ok := symRun(*c.Sym, props); ok {
+				p.Runs = append(p.Runs, run)
+			}
 		}
 	}
 }
@@ -1875,15 +2073,73 @@ func lineSpacingFrom(line, rule string) (LineSpacingRule, float64) {
 // inline w:rPr → its w:rStyle character style (basedOn-merged) → the paragraph
 // style's w:rPr → w:rPrDefault → hardcoded defaults.
 func resolveRunProps(inline *xmlRPr, pStyleRPr *xmlRPr, sc styleContext) RunProperties {
+	return runPropsFrom(runRPr(inline, pStyleRPr, sc), sc)
+}
+
+// runRPr merges a run's w:rPr over its character style, its paragraph style
+// and the tiers beneath them; nil when none of them declares anything.
+func runRPr(inline *xmlRPr, pStyleRPr *xmlRPr, sc styleContext) *xmlRPr {
 	var charRPr *xmlRPr
 	if inline != nil && inline.RStyle != nil {
 		if id := strings.TrimSpace(inline.RStyle.Val); id != "" {
 			charRPr = sc.chars[id] // nil for an unknown style id (tier skipped)
 		}
 	}
-	merged := mergeRPr(inline, mergeRPr(charRPr, mergeRPr(pStyleRPr, sc.underRPr())))
-	return runPropsFrom(merged, sc)
+	return mergeRPr(inline, mergeRPr(charRPr, mergeRPr(pStyleRPr, sc.underRPr())))
 }
+
+// symRun turns a <w:sym> into a run of its one character, in its own font
+// (the run's when it names none). A single-byte code is moved into the
+// private-use range, where Word's symbol fonts keep it. ok is false for a
+// code that is not hexadecimal.
+func symRun(sym xmlSym, props RunProperties) (Run, bool) {
+	code, err := strconv.ParseUint(strings.TrimSpace(sym.Char), 16, 16)
+	if err != nil {
+		return Run{}, false
+	}
+	if code < 0x100 {
+		code += 0xF000
+	}
+	if font := strings.TrimSpace(sym.Font); font != "" {
+		props.FontFamily = font
+	}
+	return Run{Text: string(rune(code)), Props: props}, true
+}
+
+// casedRuns turns a run's text into runs as w:caps and w:smallCaps show it:
+// all caps uppercases it; small caps draws its lowercase letters as capitals
+// at a reduced size, so the text splits wherever the letter case changes. All
+// caps wins when a run carries both, as in Word.
+func casedRuns(text string, rpr *xmlRPr, props RunProperties) []Run {
+	if rpr != nil && rpr.Caps.on() {
+		return []Run{{Text: strings.ToUpper(text), Props: props}}
+	}
+	if rpr == nil || !rpr.SmallCaps.on() {
+		return []Run{{Text: text, Props: props}}
+	}
+	small := props
+	small.SizePt *= smallCapsScale
+	var runs []Run
+	for text != "" {
+		first, _ := utf8.DecodeRuneInString(text)
+		lower := unicode.IsLower(first)
+		n := strings.IndexFunc(text, func(r rune) bool { return unicode.IsLower(r) != lower })
+		if n < 0 {
+			n = len(text)
+		}
+		if lower {
+			runs = append(runs, Run{Text: strings.ToUpper(text[:n]), Props: small})
+		} else {
+			runs = append(runs, Run{Text: text[:n], Props: props})
+		}
+		text = text[n:]
+	}
+	return runs
+}
+
+// smallCapsScale is the size of the capitals that stand in for lowercase
+// letters in small caps, relative to the run's own size.
+const smallCapsScale = 0.8
 
 // runPropsFrom turns an already-merged w:rPr into public RunProperties,
 // filling unset fields with the hardcoded defaults and resolving colors, the
@@ -1900,6 +2156,7 @@ func runPropsFrom(rpr *xmlRPr, sc styleContext) RunProperties {
 	props.Bold = rpr.Bold.on()
 	props.Italic = rpr.Italic.on()
 	props.Underline = underlineOn(rpr.Underline)
+	props.Strike = rpr.Strike.on() || rpr.DStrike.on()
 	if name := resolveFontFamily(rpr.Fonts, sc.themeFonts); name != "" {
 		props.FontFamily = name
 	}
@@ -2042,12 +2299,14 @@ func buildTable(xt xmlTable, sc styleContext) Table {
 		nCols: tableGridColCount(xt),
 	}
 	var tblInd *xmlTblInd
+	var jc *xmlVal
 	var look *xmlTblLook
 	var inlineCellMar *xmlTcMar
 	var fixedLayout bool
 	if xt.Props != nil {
 		tc.borders = xt.Props.Borders
 		tblInd = xt.Props.Ind
+		jc = xt.Props.Jc
 		look = xt.Props.Look
 		inlineCellMar = xt.Props.CellMar
 		fixedLayout = xt.Props.Layout != nil &&
@@ -2057,6 +2316,9 @@ func buildTable(xt xmlTable, sc styleContext) Table {
 				tc.style, tc.haveStyle = rs, true
 				if tblInd == nil {
 					tblInd = rs.Ind
+				}
+				if jc == nil {
+					jc = rs.Jc
 				}
 			}
 		}
@@ -2082,6 +2344,7 @@ func buildTable(xt xmlTable, sc styleContext) Table {
 		ColumnWidths:   widths,
 		ColumnPercents: percents,
 		IndentPt:       tblIndPt(tblInd),
+		Alignment:      alignmentFrom(jc),
 		HeaderRows:     headerRows,
 		FixedLayout:    fixedLayout,
 	}

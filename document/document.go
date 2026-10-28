@@ -38,9 +38,12 @@ const (
 
 // RunProperties is the character formatting a Run needs for layout.
 type RunProperties struct {
-	Bold       bool
-	Italic     bool
-	Underline  bool
+	Bold      bool
+	Italic    bool
+	Underline bool
+	// Strike draws a line through the text (w:strike; a w:dstrike double
+	// strikethrough is drawn as a single line).
+	Strike     bool
 	FontFamily string
 	SizePt     float64
 	// Color is the run's resolved text color as "#RRGGBB", or "" when
@@ -178,6 +181,12 @@ type ParagraphProperties struct {
 	// custom stop (word/settings.xml's w:defaultTabStop); zero means Word's
 	// default half inch.
 	DefaultTabStopPt float64
+	// KeepNext keeps the paragraph on the same page as the start of what
+	// follows it (w:keepNext), as a heading is kept with its text.
+	KeepNext bool
+	// KeepLines keeps the paragraph's lines on one page (w:keepLines). Neither
+	// moves a paragraph that no page could hold.
+	KeepLines bool
 }
 
 // TabAlign is how text aligns against a tab stop (w:tab/@w:val).
@@ -283,6 +292,10 @@ type Table struct {
 	// w:tblInd, inline winning over the table's named style). Zero when
 	// neither declares one.
 	IndentPt float64
+	// Alignment places the table in the width available to it (w:jc, inline
+	// winning over the table's named style). A centered or right-aligned table
+	// ignores IndentPt, as Word does; AlignJustify is drawn as AlignLeft.
+	Alignment Alignment
 	// HeaderRows is how many leading rows are marked as header rows
 	// (w:tblHeader) and are therefore repeated at the top of every page the
 	// table continues onto.

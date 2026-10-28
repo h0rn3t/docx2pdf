@@ -46,7 +46,7 @@ func TestOpen_EmbeddedFontsAreDeobfuscated(t *testing.T) {
 func TestRenderer_RealFontIsUsedWhereItHasTheGlyphs(t *testing.T) {
 	mono := fonts.Bytes(fonts.Mono, false, false)
 	r := newFPDFRenderer(testGeometry.WidthPt, testGeometry.HeightPt, []Font{{Family: "Calibri", Data: mono}}, nil)
-	r.SetFont("Calibri", false, false, false, 10)
+	r.SetFont("Calibri", false, false, false, false, 10)
 
 	// Liberation Mono's glyphs are all 0.6 em wide; Carlito's "i" is far
 	// narrower, so the width tells which font measured it.
@@ -61,7 +61,7 @@ func TestRenderer_RealFontIsUsedWhereItHasTheGlyphs(t *testing.T) {
 func TestRenderer_BrokenFontIsNotRegistered(t *testing.T) {
 	broken := append([]byte{0, 1, 0, 0}, bytes.Repeat([]byte{0xff}, 64)...) // a TrueType tag, garbage after
 	r := newFPDFRenderer(testGeometry.WidthPt, testGeometry.HeightPt, []Font{{Family: "Bad", Data: broken}}, nil)
-	r.SetFont("Bad", false, false, false, 10)
+	r.SetFont("Bad", false, false, false, false, 10)
 	r.AddPage(testGeometry.WidthPt, testGeometry.HeightPt)
 	r.DrawText(10, 10, "text")
 	if err := r.Output(&bytes.Buffer{}); err != nil {

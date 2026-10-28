@@ -36,6 +36,31 @@ func TestLayoutTable_ColumnOffsetsIncludeTableIndent(t *testing.T) {
 	}
 }
 
+func TestLayoutTable_AlignmentShiftsColumns(t *testing.T) {
+	tests := []struct {
+		name  string
+		align Alignment
+		want  float64 // the first column's offset
+	}{
+		{"left keeps indent", AlignLeft, 100},
+		{"center ignores indent", AlignCenter, (contentWidthPt - 100) / 2},
+		{"right ignores indent", AlignRight, contentWidthPt - 100},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tbl := Table{ColumnWidths: []float64{60, 40}, IndentPt: 100, Alignment: tt.align}
+			tl := layoutTable(&fakeRenderer{}, tbl, contentWidthPt, contentHeightPt)
+
+			if tl.colOffsets[0] != tt.want || tl.colOffsets[1] != tt.want+60 {
+				t.Errorf("align %v: colOffsets = %v, want [%v %v]", tt.align, tl.colOffsets, tt.want, tt.want+60)
+			}
+			if got := tl.width(); got != tt.want+100 {
+				t.Errorf("align %v: width() = %v, want %v", tt.align, got, tt.want+100)
+			}
+		})
+	}
+}
+
 func TestRenderTable_CellsAtColumnPositions(t *testing.T) {
 	f := &fakeRenderer{}
 	tbl := Table{

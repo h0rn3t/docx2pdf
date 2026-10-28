@@ -207,6 +207,21 @@ func TestNumbering_Bullet(t *testing.T) {
 	}
 }
 
+// Word's own bullet is U+F0B7 in the Symbol font: the marker keeps the font, so
+// the renderer can stand a • in for it when Symbol is not installed.
+func TestNumbering_SymbolFontBulletKeepsItsFont(t *testing.T) {
+	num := `<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/><w:lvlText w:val="` + "\uF0B7" + `"/>` +
+		`<w:rPr><w:rFonts w:ascii="Symbol" w:hAnsi="Symbol" w:hint="default"/></w:rPr></w:lvl></w:abstractNum>
+		<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>`
+	body := `<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>x</w:t></w:r></w:p>`
+	doc := mustOpenWith(t, body, map[string]string{"word/numbering.xml": docxtest.Numbering(num)})
+
+	marker := paragraphs(t, doc)[0].Runs[0]
+	if marker.Text != "\uF0B7" || marker.Props.FontFamily != "Symbol" {
+		t.Errorf("marker = %q in %q, want \"\\uF0B7\" in Symbol", marker.Text, marker.Props.FontFamily)
+	}
+}
+
 func TestNumbering_LowerLetter(t *testing.T) {
 	num := `<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="lowerLetter"/><w:lvlText w:val="%1)"/></w:lvl></w:abstractNum>
 		<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>`

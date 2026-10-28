@@ -93,24 +93,40 @@ func (tl tableLayout) width() float64 {
 // layoutTable measures every row and cell of t against the width available to
 // it (the page column for a top-level table, the parent cell's content box for a
 // nested one). Column widths that the document leaves open are resolved from the
-// content first (Word's auto-fit); column x-offsets then follow from t.IndentPt,
-// so every cell - drawn via x0 + colOffsets[i] - picks up the table's own
+// content first (Word's auto-fit); column x-offsets then follow from t.IndentPt
+// (or, for a centered or right-aligned table, from its alignment), so every cell - drawn via x0 + colOffsets[i] - picks up the table's own
 // indent, relative to whatever frame x0 is measured from. Each row's height
 // comes from its tallest non-continuation cell, floored at minRowHeightPt, and a
 // vertically merged cell then stretches the rows it spans if it still needs more
 // room.
 func layoutTable(r renderer, t Table, availWidth, availHeight float64) tableLayout {
 	widths := resolveTableWidths(r, t, availWidth)
+	// A percentage cell margin is a percentage of the table's width, which is
+	// only settled now that the columns are.
+	var tableWidth float64
+	for _, w := range widths {
+		tableWidth += w
+	}
+	// A centered or right-aligned table ignores its indent, as in Word; a
+	// floating one is placed by its own position instead.
+	start := t.IndentPt
+	if t.Float == nil {
+		switch t.Alignment {
+		case AlignCenter:
+			start = math.Max((availWidth-tableWidth)/2, 0)
+		case AlignRight:
+			start = math.Max(availWidth-tableWidth, 0)
+		case AlignLeft, AlignJustify:
+			// Starts at its indent.
+		}
+	}
 	offsets := make([]float64, len(widths))
-	acc := t.IndentPt
+	acc := start
 	for i, w := range widths {
 		offsets[i] = acc
 		acc += w
 	}
 	tl := tableLayout{colWidths: widths, colOffsets: offsets, headerRows: t.HeaderRows}
-	// A percentage cell margin is a percentage of the table's width, which is
-	// only settled now that the columns are.
-	tableWidth := acc - t.IndentPt
 
 	for _, row := range t.Rows {
 		col := 0
