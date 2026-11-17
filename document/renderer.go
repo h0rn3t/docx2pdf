@@ -40,6 +40,9 @@ type renderer interface {
 	// SetFont selects the active font for subsequent TextWidth/DrawText calls;
 	// underline and strike decorate the text DrawText draws.
 	SetFont(family string, bold, italic, underline, strike bool, sizePt float64)
+	// SetCharSpacing sets the room added after each character for subsequent
+	// TextWidth/DrawText calls, in points; SetFont leaves it as it is.
+	SetCharSpacing(pt float64)
 	// SetTextColor sets the fill color for subsequent DrawText calls from a
 	// "#RRGGBB" string; an empty or malformed value selects black.
 	SetTextColor(colorHex string)

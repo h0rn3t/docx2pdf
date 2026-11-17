@@ -13,6 +13,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	pathpkg "path"
 	"sync"
@@ -58,6 +59,9 @@ type RunProperties struct {
 	// when negative: w:position, plus superscript/subscript (w:vertAlign), whose
 	// text SizePt already gives at its reduced size.
 	BaselineShiftPt float64
+	// CharSpacingPt is the room added after each character (w:rPr/w:spacing),
+	// in points; negative condenses the text.
+	CharSpacingPt float64
 }
 
 // Image is a picture embedded in the document, ready to be drawn: the media
@@ -187,6 +191,20 @@ type ParagraphProperties struct {
 	// KeepLines keeps the paragraph's lines on one page (w:keepLines). Neither
 	// moves a paragraph that no page could hold.
 	KeepLines bool
+	// Borders are the rules drawn around the paragraph (w:pBdr).
+	Borders ParagraphBorders
+}
+
+// ParagraphBorders are a paragraph's borders (w:pBdr). Top and Bottom run
+// between the paragraph's indents; Left and Right stand outside them. Word
+// draws consecutive paragraphs with the same borders and indents as one box:
+// a rule only above the first and below the last, and Between separating them.
+type ParagraphBorders struct {
+	Top, Bottom, Left, Right, Between BorderSide
+
+	// joinPrev and joinNext report that the paragraph before or after this
+	// one shares its box.
+	joinPrev, joinNext bool
 }
 
 // TabAlign is how text aligns against a tab stop (w:tab/@w:val).
@@ -411,6 +429,8 @@ type BorderSide struct {
 	Style   string // raw w:val (e.g. "single", "double"); "" means no border
 	WidthPt float64
 	Color   string // "#RRGGBB"; "" when undeclared or "auto"
+	// SpacePt is a paragraph border's distance from the text (w:space).
+	SpacePt float64
 }
 
 // CellBorders holds a cell's resolved per-side border (w:tcBorders overriding
@@ -541,8 +561,32 @@ func Open(path string) (*Document, error) {
 		return nil, fmt.Errorf("docx2pdf: open docx %q: %w", path, err)
 	}
 	defer func() { _ = r.Close() }()
+	return build(newPkg(r.File), path)
+}
 
-	p := newPkg(r.File)
+// ErrTooLarge is returned by OpenReader for a .docx larger than it reads.
+var ErrTooLarge = errors.New("docx2pdf: docx too large")
+
+// maxDocxSize is the largest .docx OpenReader reads, in bytes.
+const maxDocxSize = 64 << 20
+
+// OpenReader is Open for a .docx of size bytes read from r - one held in
+// memory is bytes.NewReader(data) and len(data). A .docx over 64 MiB is
+// refused with an error wrapping ErrTooLarge, before any of it is read.
+func OpenReader(r io.ReaderAt, size int64) (*Document, error) {
+	if size > maxDocxSize {
+		return nil, fmt.Errorf("docx2pdf: %d-byte docx (limit %d): %w", size, maxDocxSize, ErrTooLarge)
+	}
+	zr, err := zip.NewReader(r, size)
+	if err != nil {
+		return nil, fmt.Errorf("docx2pdf: open docx: %w", err)
+	}
+	return build(newPkg(zr.File), "docx")
+}
+
+// build reads the Document out of an opened package; name identifies the
+// package in errors.
+func build(p *pkg, path string) (*Document, error) {
 	mainName := p.relatedPart("", "officeDocument", "word/document.xml")
 	main, err := p.part(mainName)
 	if errors.Is(err, fs.ErrNotExist) {

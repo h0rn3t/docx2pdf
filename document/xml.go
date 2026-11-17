@@ -253,6 +253,7 @@ type xmlPPr struct {
 	NumPr           *xmlNumPr    `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main numPr"`
 	Shd             *xmlShd      `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main shd"`
 	Tabs            *xmlTabs     `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main tabs"`
+	PBdr            *xmlBorders  `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main pBdr"`
 	// ContextualSpacing drops the space before/after the paragraph next to
 	// one of the same style.
 	ContextualSpacing *xmlOnOff `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main contextualSpacing"`
@@ -585,6 +586,7 @@ type xmlRPr struct {
 	Caps      *xmlOnOff  `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main caps"`
 	SmallCaps *xmlOnOff  `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main smallCaps"`
 	Vanish    *xmlOnOff  `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main vanish"`
+	Spacing   *xmlVal    `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main spacing"`
 }
 
 // xmlColor is <w:color>: an explicit sRGB hex value (w:val, or "auto") and/or a
@@ -828,12 +830,15 @@ type xmlBorders struct {
 	InsideV *xmlBorder `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main insideV"`
 	TL2BR   *xmlBorder `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main tl2br"`
 	TR2BL   *xmlBorder `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main tr2bl"`
+	// Between only a paragraph declares (w:pBdr).
+	Between *xmlBorder `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main between"`
 }
 
 type xmlBorder struct {
 	Val   string `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main val,attr"`
 	Sz    string `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main sz,attr"`
 	Color string `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main color,attr"`
+	Space string `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main space,attr"`
 }
 
 // --- Table styles (word/styles.xml) ---
@@ -1138,6 +1143,7 @@ func mergePPr(own, fallback *xmlPPr) *xmlPPr {
 		NumPr:   coalesceNumPr(o.NumPr, f.NumPr),
 		Shd:     coalesceShd(o.Shd, f.Shd),
 		Tabs:    mergeTabs(o.Tabs, f.Tabs),
+		PBdr:    cmp.Or(o.PBdr, f.PBdr),
 
 		ContextualSpacing: coalesceOnOff(o.ContextualSpacing, f.ContextualSpacing),
 		KeepNext:          coalesceOnOff(o.KeepNext, f.KeepNext),
@@ -1259,6 +1265,7 @@ type resolvedParaStyle struct {
 	NumPr   *xmlNumPr
 	Shd     *xmlShd
 	Tabs    *xmlTabs
+	PBdr    *xmlBorders
 	RPr     *xmlRPr
 
 	ContextualSpacing *xmlOnOff
@@ -1308,6 +1315,7 @@ func resolveParaStyle(id string, defs map[string]xmlStyle, cache map[string]reso
 		own.NumPr = def.PPr.NumPr
 		own.Shd = def.PPr.Shd
 		own.Tabs = def.PPr.Tabs
+		own.PBdr = def.PPr.PBdr
 		own.ContextualSpacing = def.PPr.ContextualSpacing
 		own.KeepNext = def.PPr.KeepNext
 		own.KeepLines = def.PPr.KeepLines
@@ -1324,6 +1332,7 @@ func resolveParaStyle(id string, defs map[string]xmlStyle, cache map[string]reso
 		NumPr:   coalesceNumPr(own.NumPr, parent.NumPr),
 		Shd:     coalesceShd(own.Shd, parent.Shd),
 		Tabs:    mergeTabs(own.Tabs, parent.Tabs),
+		PBdr:    cmp.Or(own.PBdr, parent.PBdr),
 		RPr:     mergeRPr(own.RPr, parent.RPr),
 
 		ContextualSpacing: coalesceOnOff(own.ContextualSpacing, parent.ContextualSpacing),
@@ -1409,6 +1418,7 @@ func mergeRPr(own, fallback *xmlRPr) *xmlRPr {
 		Caps:      coalesceOnOff(o.Caps, f.Caps),
 		SmallCaps: coalesceOnOff(o.SmallCaps, f.SmallCaps),
 		Vanish:    coalesceOnOff(o.Vanish, f.Vanish),
+		Spacing:   coalesceVal(o.Spacing, f.Spacing),
 	}
 }
 
@@ -1560,6 +1570,10 @@ func buildBody(body xmlBody, sc styleContext) ([]BodyElement, []sectionBreak) {
 					p.Props.Spacing.BeforePt = 0
 				}
 			}
+			if prev != nil && sameBorderBox(prev.Props, p.Props) {
+				prev.Props.Borders.joinNext = true
+				p.Props.Borders.joinPrev = true
+			}
 			prev, prevStyle, prevContextual = &p, style, contextual
 			elems = append(elems, BodyElement{Paragraph: &p})
 			// A text box's content follows the paragraph it is anchored in: it is
@@ -1684,6 +1698,20 @@ func buildParagraph(xp xmlParagraph, sc styleContext) Paragraph {
 		shd = under.Shd
 	}
 	p.Props.Shading = resolveShading(shd, sc.theme)
+
+	// Borders: the nearest of inline w:pBdr → paragraph style → table style →
+	// docDefaults, as a whole.
+	var pBdr *xmlBorders
+	if inlinePPr != nil {
+		pBdr = inlinePPr.PBdr
+	}
+	if pBdr == nil && hasStyle {
+		pBdr = ps.PBdr
+	}
+	if pBdr == nil && under != nil {
+		pBdr = under.PBdr
+	}
+	p.Props.Borders = paragraphBorders(pBdr)
 
 	// Tab stops accumulate down the tiers rather than one tier winning:
 	// docDefaults/table style, then the paragraph style, then the paragraph.
@@ -2171,6 +2199,11 @@ func runPropsFrom(rpr *xmlRPr, sc styleContext) RunProperties {
 	if rpr.Position != nil {
 		if hp, err := strconv.ParseFloat(strings.TrimSpace(rpr.Position.Val), 64); err == nil {
 			props.BaselineShiftPt = hp / 2 // half-points → points
+		}
+	}
+	if rpr.Spacing != nil {
+		if twips, err := strconv.ParseFloat(strings.TrimSpace(rpr.Spacing.Val), 64); err == nil {
+			props.CharSpacingPt = twips / 20
 		}
 	}
 	if rpr.VertAlign != nil {
@@ -2828,6 +2861,29 @@ func resolveBorderSide(tblSide, cellSide *xmlBorder) BorderSide {
 		WidthPt: width,
 		Color:   normalizeBorderColor(b.Color),
 	}
+}
+
+// sameBorderBox reports whether Word draws paragraph b, right after a, in a's
+// border box: both have the same borders, and the same side indents.
+func sameBorderBox(a, b ParagraphProperties) bool {
+	a.Borders.joinPrev, a.Borders.joinNext = false, false
+	return a.Borders != (ParagraphBorders{}) && a.Borders == b.Borders &&
+		a.Indent.LeftPt == b.Indent.LeftPt && a.Indent.RightPt == b.Indent.RightPt
+}
+
+// paragraphBorders resolves w:pBdr; nil is no borders.
+func paragraphBorders(b *xmlBorders) ParagraphBorders {
+	if b == nil {
+		return ParagraphBorders{}
+	}
+	side := func(x *xmlBorder) BorderSide {
+		s := resolveBorderSide(nil, x)
+		if s.Style != "" {
+			s.SpacePt, _ = strconv.ParseFloat(strings.TrimSpace(x.Space), 64) // w:space is in points
+		}
+		return s
+	}
+	return ParagraphBorders{Top: side(b.Top), Bottom: side(b.Bottom), Left: side(b.Left), Right: side(b.Right), Between: side(b.Between)}
 }
 
 // normalizeBorderColor turns a raw OOXML border color into "#RRGGBB",

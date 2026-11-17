@@ -12,6 +12,7 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"time"
 )
 
 // fillFields returns p with its computed field runs (PAGE/NUMPAGES) resolved to
@@ -148,7 +149,7 @@ func setPageNumber(r renderer, ln *line, pageNo int) {
 			continue
 		}
 		w.text = strconv.Itoa(pageNo)
-		r.SetFont(w.props.FontFamily, w.props.Bold, w.props.Italic, w.props.Underline, w.props.Strike, w.props.SizePt)
+		setRunFont(r, w.props)
 		width := r.TextWidth(w.text)
 		ln.natural += width - w.width
 		w.width = width
@@ -171,8 +172,9 @@ func (d *Document) WritePDFTo(w io.Writer) error {
 
 // Converter renders a document to PDF. Create one with ConvertToPdf.
 type Converter struct {
-	doc    *Document
-	system *fontIndex
+	doc     *Document
+	system  *fontIndex
+	created time.Time // the PDF's creation date, or zero for the time of writing
 }
 
 // WithSystemFonts makes the converter draw text in the fonts installed on this
@@ -184,6 +186,14 @@ type Converter struct {
 // output then depends on the machine it is made on.
 func (c *Converter) WithSystemFonts(dirs ...string) *Converter {
 	c.system = newFontIndex(dirs)
+	return c
+}
+
+// WithCreationDate stamps the PDF with t as its creation and modification
+// date instead of the time it is written, so the same document converts to
+// the same bytes - for comparing output with a stored reference PDF.
+func (c *Converter) WithCreationDate(t time.Time) *Converter {
+	c.created = t
 	return c
 }
 
@@ -200,6 +210,10 @@ func (c *Converter) Write(w io.Writer) error {
 		embedded = c.doc.Fonts
 	}
 	r := newFPDFRenderer(g.WidthPt, g.HeightPt, embedded, c.system)
+	if !c.created.IsZero() {
+		r.pdf.SetCreationDate(c.created)
+		r.pdf.SetModificationDate(c.created)
+	}
 	c.render(r)
 	return r.Output(w)
 }
@@ -632,24 +646,36 @@ func renderParagraph(f *flow, p Paragraph) {
 	case p.Props.ColumnBreak && !f.atTop:
 		f.breakFrame()
 	}
+	ind, bdr := p.Props.Indent, p.Props.Borders
+	above, below := bdr.rules()
+	y := f.y
 	f.y += p.Props.Spacing.BeforePt
+	if bdr.joinPrev {
+		f.drawSides(bdr, ind, y, f.y) // the box runs on through the spacing
+	}
 
 	p = fillFields(p, f.pageNo, f.numPages)
 	p, floats := splitFloats(p)
 	for _, img := range floats {
 		f.placeFloat(img)
 	}
+	if above.Style != "" {
+		f.lineSlot(ind, ruleExtent(above))
+		y = f.y
+		f.drawRule(above, bdr, ind)
+		f.y += above.SpacePt
+		f.drawSides(bdr, ind, y, f.y)
+		f.atTop = false
+	}
 	laidOutOn := f.pageNo
-	ind := p.Props.Indent
 	b := newLineBreaker(f.r, p)
 	if b.done() { // empty paragraph advances one line at its line spacing
 		h := lineHeightFor(defaultRenderSizePt, 0, p.Props.Spacing)
 		f.lineSlot(ind, h)
 		f.placeAnchors(p.Bookmarks)
+		f.drawSides(bdr, ind, f.y, f.y+h)
 		f.y += h
 		f.atTop = false
-		f.y += p.Props.Spacing.AfterPt
-		return
 	}
 
 	for first := true; !b.done(); first = false {
@@ -692,11 +718,101 @@ func renderParagraph(f *flow, p Paragraph) {
 		}
 		drawBarTabs(f.r, p.Props.Tabs, f.frame().originX, f.y, ln.height)
 		drawLine(f.r, ln, p.Props.Alignment, x, slot, f.y, b.done(), ind.FirstLineOffsetPt, first)
+		f.drawSides(bdr, ind, f.y, f.y+ln.height)
 		f.y += ln.height
 		f.atTop = false
 		f.addNotes(notes)
 	}
+	if below.Style != "" {
+		y = f.y
+		f.y += below.SpacePt
+		f.drawRule(below, bdr, ind)
+		f.drawSides(bdr, ind, y, f.y)
+	}
+	y = f.y
 	f.y += p.Props.Spacing.AfterPt
+	if bdr.joinNext {
+		f.drawSides(bdr, ind, y, f.y)
+	}
+}
+
+// rules are the horizontal borders above and below the paragraph. In a box
+// of paragraphs, Between stands above each paragraph but the first, and only
+// the last has the bottom border.
+func (b ParagraphBorders) rules() (above, below BorderSide) {
+	above, below = b.Top, b.Bottom
+	if b.joinPrev {
+		above = b.Between
+	}
+	if b.joinNext {
+		below = BorderSide{}
+	}
+	return above, below
+}
+
+// ruleExtent is the height a horizontal paragraph border adds: the rule and
+// its distance from the text.
+func ruleExtent(s BorderSide) float64 {
+	if s.Style == "" {
+		return 0
+	}
+	return s.thickness() + s.SpacePt
+}
+
+// drawRule draws a horizontal paragraph border at the cursor - between the
+// paragraph's indents, widened to take in its side borders - and moves the
+// cursor past it.
+func (f *flow) drawRule(side BorderSide, b ParagraphBorders, ind Indent) {
+	fr := f.frame()
+	lo := fr.originX + ind.LeftPt - b.Left.SpacePt - b.Left.thickness()
+	hi := fr.originX + fr.contentWidth - ind.RightPt + b.Right.SpacePt + b.Right.thickness()
+	mid := f.y + side.thickness()/2
+	strokeParagraphBorder(f.r, side, lo, mid, hi, mid)
+	f.y += side.thickness()
+}
+
+// drawSides draws the paragraph's left and right borders down [y0, y1], just
+// outside its indents.
+func (f *flow) drawSides(b ParagraphBorders, ind Indent, y0, y1 float64) {
+	if y1 <= y0 {
+		return
+	}
+	fr := f.frame()
+	x := fr.originX + ind.LeftPt - b.Left.SpacePt - b.Left.thickness()/2
+	strokeParagraphBorder(f.r, b.Left, x, y0, x, y1)
+	x = fr.originX + fr.contentWidth - ind.RightPt + b.Right.SpacePt + b.Right.thickness()/2
+	strokeParagraphBorder(f.r, b.Right, x, y0, x, y1)
+}
+
+// strokeParagraphBorder draws side along the horizontal or vertical line
+// from (x1, y1) to (x2, y2): a double border as two lines, one line width to
+// either side of it. (A table's double border is still drawn as one line.)
+func strokeParagraphBorder(r renderer, side BorderSide, x1, y1, x2, y2 float64) {
+	if side.Style != "double" {
+		drawBorderSide(r, side, x1, y1, x2, y2)
+		return
+	}
+	var dx, dy float64 // the offset of each line
+	if y1 == y2 {
+		dy = side.WidthPt
+	} else {
+		dx = side.WidthPt
+	}
+	r.StrokeLine(x1-dx, y1-dy, x2-dx, y2-dy, side.WidthPt, side.Color)
+	r.StrokeLine(x1+dx, y1+dy, x2+dx, y2+dy, side.WidthPt, side.Color)
+}
+
+// thickness is how much room a paragraph border takes across its length: a
+// double border is two lines with a line's width between them.
+func (s BorderSide) thickness() float64 {
+	switch s.Style {
+	case "":
+		return 0
+	case "double":
+		return 3 * s.WidthPt
+	default:
+		return s.WidthPt
+	}
 }
 
 // minWrapWidthPt is the narrowest room beside a floating object that a line
@@ -909,7 +1025,8 @@ func blockHeight(r renderer, elems []BodyElement, width float64) float64 {
 		switch {
 		case el.Paragraph != nil:
 			p := *el.Paragraph
-			h += p.Props.Spacing.BeforePt + p.Props.Spacing.AfterPt
+			above, below := p.Props.Borders.rules()
+			h += p.Props.Spacing.BeforePt + p.Props.Spacing.AfterPt + ruleExtent(above) + ruleExtent(below)
 			lines := layoutParagraph(r, p, width-p.Props.Indent.LeftPt-p.Props.Indent.RightPt)
 			if len(lines) == 0 {
 				h += lineHeightFor(defaultRenderSizePt, 0, p.Props.Spacing)

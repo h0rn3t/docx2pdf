@@ -7,6 +7,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/go-pdf/fpdf"
 	"golang.org/x/image/font/sfnt"
@@ -33,10 +34,15 @@ type fpdfRenderer struct {
 	faces map[faceKey]*realFace
 	// system finds installed fonts, or is nil when they are not used.
 	system *fontIndex
+	// bundled records the bundled faces registered with the backend, by fpdf
+	// family and style: a face is added when first drawn in, so the PDF
+	// embeds only the faces it uses.
+	bundled map[string]bool
 	// cur is what the last SetFont asked for; the face it resolves to is
 	// picked per string, since a real font may lack a glyph the string needs.
-	cur    fontRequest
-	glyphs sfnt.Buffer
+	cur     fontRequest
+	spacing float64 // SetCharSpacing's
+	glyphs  sfnt.Buffer
 }
 
 // realFace is a real font registered with the backend under name, with its
@@ -52,18 +58,6 @@ type fontRequest struct {
 	size                            float64
 }
 
-// utf8Styles are the style strings each embedded family is registered under,
-// matching fpdf's AddUTF8Font convention ("" regular, B, I, BI).
-var utf8Styles = []struct {
-	str          string
-	bold, italic bool
-}{
-	{"", false, false},
-	{"B", true, false},
-	{"I", false, true},
-	{"BI", true, true},
-}
-
 // newFPDFRenderer creates a backend whose pages are widthPt × heightPt (points),
 // sized from the document's page geometry rather than a fixed A4. Text in a
 // family the document embeds (embedded) is drawn in it, and - when system is
@@ -77,15 +71,10 @@ func newFPDFRenderer(widthPt, heightPt float64, embedded []Font, system *fontInd
 		Size:    fpdf.SizeType{Wd: widthPt, Ht: heightPt},
 	})
 	pdf.SetAutoPageBreak(false, 0) // pagination is handled by the layout
-	for _, family := range fonts.Families {
-		for _, s := range utf8Styles {
-			pdf.AddUTF8FontFromBytes(family, s.str, fonts.Bytes(family, s.bold, s.italic))
-		}
-	}
-	pdf.SetFont(fonts.Sans, "", defaultRenderSizePt) // a font must be set before any text op
+	pdf.SetCatalogSort(true)       // the same document gives the same bytes
 	r := &fpdfRenderer{
 		pdf: pdf, images: make(map[string]bool), anchors: make(map[string]int), placed: make(map[string]bool),
-		faces: make(map[faceKey]*realFace), system: system,
+		faces: make(map[faceKey]*realFace), system: system, bundled: make(map[string]bool),
 		cur: fontRequest{family: fonts.Sans, size: defaultRenderSizePt},
 	}
 	for _, f := range embedded {
@@ -166,15 +155,19 @@ func (r *fpdfRenderer) selectFont(s string) string {
 		r.pdf.SetFont(f.name, c.decoration(), c.size)
 		return s
 	}
-	var style strings.Builder
+	var face string // fpdf's style letters for the face: "", B, I or BI
 	if c.bold {
-		style.WriteByte('B')
+		face += "B"
 	}
 	if c.italic {
-		style.WriteByte('I')
+		face += "I"
 	}
-	style.WriteString(c.decoration())
-	r.pdf.SetFont(mapFontFamily(c.family), style.String(), c.size)
+	family := mapFontFamily(c.family)
+	if !r.bundled[family+face] {
+		r.bundled[family+face] = true
+		r.pdf.AddUTF8FontFromBytes(family, face, fonts.Bytes(family, c.bold, c.italic))
+	}
+	r.pdf.SetFont(family, face+c.decoration(), c.size)
 	return symbolText(c.family, s)
 }
 
@@ -209,8 +202,11 @@ func (r *fpdfRenderer) SetTextColor(colorHex string) {
 	r.pdf.SetTextColor(cr, cg, cb)
 }
 
+func (r *fpdfRenderer) SetCharSpacing(pt float64) { r.spacing = pt }
+
 func (r *fpdfRenderer) TextWidth(s string) float64 {
-	return r.pdf.GetStringWidth(r.selectFont(s))
+	s = r.selectFont(s)
+	return r.pdf.GetStringWidth(s) + r.spacing*float64(utf8.RuneCountInString(s))
 }
 
 // AddPage starts a page of the requested size (each section brings its own, so
@@ -219,10 +215,20 @@ func (r *fpdfRenderer) AddPage(widthPt, heightPt float64) {
 	r.pdf.AddPageFormat("P", fpdf.SizeType{Wd: widthPt, Ht: heightPt})
 }
 
+// DrawText draws s, spaced out by the character spacing through the PDF's
+// own Tc operator: fpdf has no setting for it.
 func (r *fpdfRenderer) DrawText(x, y float64, s string) {
-	if s != "" {
-		r.pdf.Text(x, y, r.selectFont(s))
+	if s == "" {
+		return
 	}
+	s = r.selectFont(s)
+	if r.spacing == 0 {
+		r.pdf.Text(x, y, s)
+		return
+	}
+	r.pdf.RawWriteStr(fmt.Sprintf("%.3f Tc", r.spacing))
+	r.pdf.Text(x, y, s)
+	r.pdf.RawWriteStr("0 Tc")
 }
 
 // DrawImage embeds img (once, keyed by its media part name) and draws it in the

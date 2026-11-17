@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // word is a single whitespace-delimited token carrying its run's formatting.
@@ -36,6 +37,9 @@ type word struct {
 	link string
 	// note is the footnote the word references (Run.Note), or nil.
 	note *Note
+	// hyphenBreak lets a line wrap before the word although no space precedes
+	// it: it follows a hyphen inside a word, as in "інженеру-програмісту".
+	hyphenBreak bool
 }
 
 // height is what the word contributes to its line's height: a picture's full
@@ -130,7 +134,12 @@ func newLineBreaker(r renderer, p Paragraph) lineBreaker {
 func (b *lineBreaker) done() bool { return b.i >= len(b.words) && b.pending == breakNone }
 
 // next packs the next line into width, or reports false when there is none.
+// The first line is drawn shifted by the first-line indent, so it has that
+// much less room (or, under a hanging indent, more).
 func (b *lineBreaker) next(width float64) (line, bool) {
+	if !b.started {
+		width -= b.props.Indent.FirstLineOffsetPt
+	}
 	var cur []word
 	var curW, curMax, curImg float64
 	flush := func() line {
@@ -181,7 +190,7 @@ func (b *lineBreaker) next(width float64) (line, bool) {
 		// A tab is a unit of its own, and its advance depends on where the line
 		// has got to - and, for a right or centered stop, on the text after it.
 		end := i + 1
-		for !words[i].tab && end < len(words) && !words[end].lineBreak && !words[end].tab && words[end].gap == 0 {
+		for !words[i].tab && end < len(words) && !words[end].lineBreak && !words[end].tab && words[end].gap == 0 && !words[end].hyphenBreak {
 			end++
 		}
 		var unitW float64
@@ -201,7 +210,10 @@ func (b *lineBreaker) next(width float64) (line, bool) {
 			after, toDecimal := segmentWidths(b.r, words[end:])
 			unitW, leader = tabAdvance(b.props, lineStart+curW+gap, after, toDecimal)
 		}
-		if len(cur) > 0 && curW+gap+unitW > width {
+		// A stop on the right margin (9355 dxa of a 9355 dxa column) is the
+		// column's width give or take a rounding error of the twip-to-point
+		// sums; text ending there still fits.
+		if len(cur) > 0 && curW+gap+unitW > width+fitTolerancePt {
 			return flush(), true // this word opens the next, soft-wrap line
 		}
 		for k, w := range words[i:end] {
@@ -229,6 +241,10 @@ func (b *lineBreaker) next(width float64) (line, bool) {
 	}
 	return line{}, false
 }
+
+// fitTolerancePt is how far a line may overrun its width and still fit: the
+// widths are point sums of twip values, off by a float rounding error.
+const fitTolerancePt = 0.01
 
 // tabAdvance is how far a tab at x (measured from the text column's left edge)
 // advances: to the nearest stop past x - a custom one, or the implicit stop a
@@ -274,7 +290,7 @@ func segmentWidths(r renderer, words []word) (whole, toDecimal float64) {
 			break
 		}
 		if i := decimalSeparator(x.text); toDecimal < 0 && x.img == nil && i >= 0 {
-			r.SetFont(x.props.FontFamily, x.props.Bold, x.props.Italic, x.props.Underline, x.props.Strike, x.props.SizePt)
+			setRunFont(r, x.props)
 			toDecimal = whole + x.gap + r.TextWidth(x.text[:i])
 		}
 		whole += x.gap + x.width
@@ -324,7 +340,11 @@ func drawLine(r renderer, ln line, align Alignment, x0, width, y float64, isLast
 	case AlignJustify:
 		if !isLast {
 			if gaps := len(stretchable(ln)); gaps > 0 {
-				if slack := width - ln.natural; slack > 0 {
+				room := width
+				if isFirst {
+					room -= firstLineOffsetPt // the first line starts that much further in
+				}
+				if slack := room - ln.natural; slack > 0 {
 					extraPerGap = slack / float64(gaps)
 				}
 			}
@@ -388,7 +408,7 @@ func drawLine(r renderer, ln line, align Alignment, x0, width, y float64, isLast
 			drawLeader(r, w, placed[i], baseline)
 			continue
 		}
-		r.SetFont(w.props.FontFamily, w.props.Bold, w.props.Italic, w.props.Underline, w.props.Strike, w.props.SizePt)
+		setRunFont(r, w.props)
 		r.SetTextColor(w.props.Color)
 		r.DrawText(placed[i], baseline-w.props.BaselineShiftPt, w.text)
 	}
@@ -455,6 +475,7 @@ func drawLeader(r renderer, w word, x, baseline float64) {
 		return
 	}
 	r.SetFont(w.props.FontFamily, w.props.Bold, w.props.Italic, false, false, w.props.SizePt)
+	r.SetCharSpacing(0)
 	r.SetTextColor(w.props.Color)
 	cw := r.TextWidth(w.leader)
 	if cw <= 0 {
@@ -521,21 +542,58 @@ func measureWords(r renderer, p Paragraph) []word {
 			continue
 		}
 		for i, tok := range tokenize(run.Text) {
-			r.SetFont(run.Props.FontFamily, run.Props.Bold, run.Props.Italic, run.Props.Underline, run.Props.Strike, run.Props.SizePt)
+			setRunFont(r, run.Props)
 			if tok.space {
 				pendingGap += r.TextWidth(tok.text)
 				continue
 			}
-			w := word{text: tok.text, props: run.Props, width: r.TextWidth(tok.text), gap: pendingGap, field: run.Field, link: run.Link}
-			if i == 0 { // the run's advance floor applies to its first token (a list marker is one)
-				w.width = math.Max(w.width, run.MinWidthPt)
-				w.note = run.Note
+			for j, part := range splitAfterHyphens(tok.text) {
+				w := word{text: part, props: run.Props, width: r.TextWidth(part), gap: pendingGap, field: run.Field, link: run.Link}
+				if i == 0 && j == 0 { // the run's advance floor applies to its first token (a list marker is one)
+					w.width = math.Max(w.width, run.MinWidthPt)
+					w.note = run.Note
+				}
+				if n := len(words); n > 0 && w.gap == 0 {
+					w.hyphenBreak = hyphenBreak(words[n-1], part)
+				}
+				words = append(words, w)
+				pendingGap = 0
 			}
-			words = append(words, w)
-			pendingGap = 0
 		}
 	}
 	return words
+}
+
+// setRunFont makes the run's font and character spacing the renderer's.
+func setRunFont(r renderer, p RunProperties) {
+	r.SetFont(p.FontFamily, p.Bold, p.Italic, p.Underline, p.Strike, p.SizePt)
+	r.SetCharSpacing(p.CharSpacingPt)
+}
+
+// splitAfterHyphens cuts s after each hyphen a line may wrap at: one inside
+// the word with a letter after it (the break UAX #14 allows after a hyphen).
+func splitAfterHyphens(s string) []string {
+	var parts []string
+	start := 0
+	for i := 1; i < len(s)-1; i++ {
+		if s[i] == '-' && startsWithLetter(s[i+1:]) {
+			parts = append(parts, s[start:i+1])
+			start = i + 1
+		}
+	}
+	return append(parts, s[start:])
+}
+
+// hyphenBreak reports whether a line may wrap between prev and text that
+// follows it with no space: prev ends a word with a hyphen and a letter
+// follows - which also holds for a word whose halves are in two runs.
+func hyphenBreak(prev word, text string) bool {
+	return prev.img == nil && !prev.tab && len(prev.text) > 1 && strings.HasSuffix(prev.text, "-") && startsWithLetter(text)
+}
+
+func startsWithLetter(s string) bool {
+	r, _ := utf8.DecodeRuneInString(s)
+	return unicode.IsLetter(r)
 }
 
 type token struct {

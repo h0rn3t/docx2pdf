@@ -23,6 +23,7 @@ type fakeRenderer struct {
 	page      int
 	bold      bool
 	size      float64
+	spacing   float64
 	color     string
 	draws     []drawCall
 	fills     []fillCall
@@ -96,9 +97,10 @@ type pageCall struct {
 func (f *fakeRenderer) SetFont(_ string, bold, _, _, _ bool, sizePt float64) {
 	f.bold, f.size = bold, sizePt
 }
+func (f *fakeRenderer) SetCharSpacing(pt float64)    { f.spacing = pt }
 func (f *fakeRenderer) SetTextColor(colorHex string) { f.color = colorHex }
 func (f *fakeRenderer) TextWidth(s string) float64 {
-	return float64(len([]rune(s))) * f.size * 0.5
+	return float64(len([]rune(s))) * (f.size*0.5 + f.spacing)
 }
 func (f *fakeRenderer) AddPage(widthPt, heightPt float64) {
 	f.page++
