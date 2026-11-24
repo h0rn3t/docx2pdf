@@ -1,6 +1,7 @@
 # docx2pdf
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/h0rn3t/docx2pdf.svg)](https://pkg.go.dev/github.com/h0rn3t/docx2pdf/document)
+[![test](https://github.com/h0rn3t/docx2pdf/actions/workflows/test.yml/badge.svg)](https://github.com/h0rn3t/docx2pdf/actions/workflows/test.yml)
 ![Go 1.27+](https://img.shields.io/badge/go-1.27%2B-00ADD8)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
