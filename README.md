@@ -83,16 +83,142 @@ err = document.ConvertToPdf(doc).
 | Метод | Що робить |
 |---|---|
 | `WithSystemFonts(dirs...)` | Малює текст шрифтами, встановленими в ОС. Без аргументів шукає у стандартних теках системи й користувача. Вихід тоді залежить від машини. |
+| `WithFontDir(dir)` | Додає теку зі шрифтами, наприклад завантажену `fonts.Download`. Шрифт, якого немає, замінюється відкритим аналогом із цієї теки (див. нижче). |
 | `WithCreationDate(t)` | Записує `t` як дату створення й зміни PDF. Потрібно для тестів з еталонним PDF. |
 | `Write(w)` / `WriteToFile(path)` | Рендерить документ і пише PDF. |
+
+### Додаткові відкриті шрифти
+
+Вбудовані шрифти покривають Calibri, Arial, Times New Roman і Courier New. Ще 49 файлів
+(~17 МБ) бібліотека завантажує за запитом, щоб не роздувати кожен бінарник:
+
+| Шрифт у документі | Чим малюється | Кирилиця |
+|---|---|---|
+| Cambria | Caladea (метрично сумісний) | ні — кириличний текст іде вбудованим Liberation Serif |
+| Georgia | Gelasio (метрично сумісний) | ні — так само |
+| Verdana | DejaVu Sans | так |
+| Tahoma | DejaVu Sans Condensed | так |
+| Comic Sans MS | Comic Neue | ні |
+| PT Sans, PT Serif, PT Mono, Fira Sans, IBM Plex Serif, Lato, DejaVu Sans/Serif/Mono | вони самі | так |
+
+Викличте `fonts.Download` один раз під час старту програми. Файли перевіряються за
+закріпленими SHA-256, а вже завантажені повторно не качаються:
+
+```go
+import "github.com/h0rn3t/docx2pdf/document/fonts"
+
+dir, err := fonts.DefaultDir() // <кеш користувача>/docx2pdf/fonts
+if err != nil {
+	return err
+}
+if err := fonts.Download(ctx, dir); err != nil {
+	log.Printf("частину шрифтів не завантажено, буде заміна: %v", err)
+}
+...
+err = document.ConvertToPdf(doc).WithFontDir(dir).WriteToFile("out.pdf")
+```
+
+#### Шрифти Microsoft, як у Wine
+
+`fonts.DownloadMicrosoftFonts` завантажує справжні шрифти Microsoft так само, як
+`winetricks corefonts` і Debian-пакет `ttf-mscorefonts-installer`. Береться оригінальний
+інсталятор (`arial32.exe`, `times32.exe`, ... з дзеркала, яке використовує winetricks, і
+`IELPKTH.CAB` для Tahoma), а шрифти з нього розпаковуються вбудованим розпаковувачем
+CAB (MSZIP і LZX) на чистому Go, без `cabextract`. Інсталятори й шрифти перевіряються за
+закріпленими SHA-256.
+
+| Шрифт | Кирилиця |
+|---|---|
+| Arial, Arial Black, Times New Roman, Courier New, Verdana, Georgia, Trebuchet MS, Comic Sans MS, Impact, Andale Mono, Tahoma | так |
+| Webdings | символьний |
+
+Справжній шрифт має перевагу над будь-якою заміною, тож Arial і Times New Roman малюються
+ними, а не Liberation, а Verdana й Tahoma — ними, а не DejaVu. Шрифти поширюються за
+ліцензією Microsoft (EULA): викликаючи функцію, ви її приймаєте. Бібліотека шрифти не
+розповсюджує, вони завантажуються на машину користувача. Calibri й Cambria в цьому
+наборі немає: Microsoft поширювала їх лише з PowerPoint Viewer, ліцензія якого дозволяє
+використовувати шрифти тільки для перегляду презентацій.
+
+Шрифти завантажуються один раз під час старту програми, далі тека передається кожній
+конвертації:
+
+```go
+package main
+
+import (
+	"context"
+	"log"
+	"time"
+
+	"github.com/h0rn3t/docx2pdf/document"
+	"github.com/h0rn3t/docx2pdf/document/fonts"
+)
+
+func main() {
+	// Тека в кеші користувача: ~/.cache/docx2pdf/fonts на Linux,
+	// ~/Library/Caches/docx2pdf/fonts на macOS, %LocalAppData%\docx2pdf\fonts на Windows.
+	fontDir, err := fonts.DefaultDir()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Перший запуск качає ~4 МБ інсталяторів, наступні лише звіряють контрольні суми.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := fonts.DownloadMicrosoftFonts(ctx, fontDir); err != nil {
+		// Не фатально: шрифт, який не завантажився, замінюється вбудованим.
+		log.Printf("шрифти Microsoft завантажено не всі: %v", err)
+	}
+	// Відкриті шрифти можна покласти в ту саму теку: Cambria → Caladea, PT Sans тощо.
+	if err := fonts.Download(ctx, fontDir); err != nil {
+		log.Printf("відкриті шрифти завантажено не всі: %v", err)
+	}
+
+	doc, err := document.Open("in.docx")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer doc.Close()
+
+	// Arial, Times New Roman, Verdana, Tahoma... тепер малюються справжніми шрифтами.
+	if err := document.ConvertToPdf(doc).WithFontDir(fontDir).WriteToFile("out.pdf"); err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+У сервісі `fonts.DownloadMicrosoftFonts` викликається один раз у `main`, а
+`WithFontDir(fontDir)` — у кожній конвертації. Функції завантаження безпечно викликати,
+поки інші горутини конвертують: кожен файл з'являється в теці лише повністю записаним.
+
+Щоб контейнер не ходив у мережу, шрифти можна завантажити під час `docker build`
+окремою маленькою програмою, а в сервісі лишити тільки `WithFontDir("/fonts")`:
+
+```go
+// cmd/fetch-fonts: go run ./cmd/fetch-fonts /fonts
+func main() {
+	ctx := context.Background()
+	dir := os.Args[1]
+	if err := errors.Join(fonts.DownloadMicrosoftFonts(ctx, dir), fonts.Download(ctx, dir)); err != nil {
+		log.Fatal(err) // під час збирання образу краще впасти, ніж тихо втратити шрифти
+	}
+}
+```
+
+Автоматично, під час імпорту пакета, бібліотека нічого не завантажує. Без мережі
+(наприклад, у закритому контурі) можна покласти ті самі файли в теку вручну й передати її
+в `WithFontDir`.
 
 ## Командний рядок
 
 Готовий приклад лежить у [`examples/docx2pdf`](examples/docx2pdf):
 
 ```sh
-go run ./examples/docx2pdf [-system-fonts] in.docx out.pdf
+go run ./examples/docx2pdf [-system-fonts] [-download-fonts] [-download-ms-fonts] [-font-dir dir] in.docx out.pdf
 ```
+
+`-download-fonts` завантажує додаткові відкриті шрифти в кеш користувача (лише при першому
+запуску) і малює ними текст, `-download-ms-fonts` — шрифти Microsoft.
 
 ## Що підтримується
 
@@ -189,7 +315,9 @@ go run ./examples/docx2pdf [-system-fonts] in.docx out.pdf
 
 - кирилиця й Unicode через вбудовані метрично-сумісні шрифти: Calibri → Carlito,
   Arial, Times New Roman, Courier New → Liberation;
-- шрифти, вбудовані в .docx, використовуються завжди, системні — з `WithSystemFonts()`;
+- шрифти, вбудовані в .docx, використовуються завжди, системні — з `WithSystemFonts()`,
+  додаткові відкриті (Caladea, Gelasio, DejaVu, PT, Fira Sans, ...) — з `fonts.Download`
+  і `WithFontDir`;
 - у PDF потрапляють лише ті накреслення, якими справді написано текст, і лише
   потрібні символи. Через це PDF виходить компактним: сторінка заяви займає ~40 КБ.
 

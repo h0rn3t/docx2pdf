@@ -32,8 +32,9 @@ type fpdfRenderer struct {
 	// registered with the backend, by face; a nil entry remembers a face that
 	// was looked for and is not available.
 	faces map[faceKey]*realFace
-	// system finds installed fonts, or is nil when they are not used.
-	system *fontIndex
+	// installed finds fonts in font directories, searched in order; empty
+	// when only embedded and bundled fonts are used.
+	installed []*fontIndex
 	// bundled records the bundled faces registered with the backend, by fpdf
 	// family and style: a face is added when first drawn in, so the PDF
 	// embeds only the faces it uses.
@@ -63,12 +64,13 @@ type fontRequest struct {
 
 // newFPDFRenderer creates a backend whose pages are widthPt × heightPt (points),
 // sized from the document's page geometry rather than a fixed A4. Text in a
-// family the document embeds (embedded) is drawn in it, and - when system is
-// not nil - text in a family installed on the machine in that font; anything
-// else in a metric-compatible replacement.
+// family the document embeds (embedded) is drawn in it, then text in a family
+// one of the installed font directories holds - or holds the open-source
+// stand-in for (fonts.Substitute) - in that font; anything else in a
+// metric-compatible replacement.
 // simplified: no SetMargins - auto page breaks are off and the layout positions
 // all text by absolute coordinates, so fpdf's own margins have no effect here.
-func newFPDFRenderer(widthPt, heightPt float64, embedded []Font, system *fontIndex) *fpdfRenderer {
+func newFPDFRenderer(widthPt, heightPt float64, embedded []Font, installed []*fontIndex) *fpdfRenderer {
 	pdf := fpdf.NewCustom(&fpdf.InitType{
 		UnitStr: "pt",
 		Size:    fpdf.SizeType{Wd: widthPt, Ht: heightPt},
@@ -77,7 +79,7 @@ func newFPDFRenderer(widthPt, heightPt float64, embedded []Font, system *fontInd
 	pdf.SetCatalogSort(true)       // the same document gives the same bytes
 	r := &fpdfRenderer{
 		pdf: pdf, images: make(map[string]bool), anchors: make(map[string]int), placed: make(map[string]bool),
-		faces: make(map[faceKey]*realFace), system: system, bundled: make(map[string]bool),
+		faces: make(map[faceKey]*realFace), installed: installed, bundled: make(map[string]bool),
 		cur: fontRequest{family: fonts.Sans, size: defaultRenderSizePt},
 	}
 	for _, f := range embedded {
@@ -125,18 +127,28 @@ func fpdfAccepts(data []byte) (ok bool) {
 	return probe.Output(io.Discard) == nil
 }
 
-// face is the real font for a family's face: embedded, or installed when
-// system fonts are in use; nil when there is none.
+// face is the real font for a family's face: embedded, else installed in a
+// font directory - the family itself, or failing that its open-source
+// stand-in (Caladea for Cambria, ...); nil when there is none.
 func (r *fpdfRenderer) face(family string, bold, italic bool) *realFace {
 	k := newFaceKey(family, bold, italic)
-	f, seen := r.faces[k]
-	if !seen {
-		if data := r.system.lookup(k); data != nil {
-			f = r.register(data)
-		}
-		r.faces[k] = f
+	if f, seen := r.faces[k]; seen {
+		return f
 	}
-	return f
+	keys := []faceKey{k}
+	if sub := fonts.Substitute(family); sub != "" {
+		keys = append(keys, newFaceKey(sub, bold, italic))
+	}
+	r.faces[k] = nil
+	for _, key := range keys {
+		for _, ix := range r.installed {
+			if data := ix.lookup(key); data != nil {
+				r.faces[k] = r.register(data)
+				return r.faces[k]
+			}
+		}
+	}
+	return nil
 }
 
 // covers reports whether f has a glyph for every character of s.

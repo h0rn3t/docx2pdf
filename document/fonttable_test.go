@@ -69,6 +69,28 @@ func TestRenderer_BrokenFontIsNotRegistered(t *testing.T) {
 	}
 }
 
+func TestRenderer_SubstituteFromFontDirStandsInForMissingWordFont(t *testing.T) {
+	dir := t.TempDir()
+	// Liberation Mono under Caladea's family name: its 0.6 em glyphs tell
+	// which font measured the text.
+	path := filepath.Join(dir, "Caladea-Regular.ttf")
+	if err := os.WriteFile(path, fonts.Bytes(fonts.Mono, false, false), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ix := newFontIndex([]string{dir})
+	ix.once.Do(func() { ix.files = map[faceKey]string{newFaceKey("Caladea", false, false): path} })
+	r := newFPDFRenderer(testGeometry.WidthPt, testGeometry.HeightPt, nil, []*fontIndex{nil, ix})
+
+	r.SetFont("Cambria", false, false, false, false, 10)
+	if got := r.TextWidth("iiii"); got != 24 {
+		t.Errorf("TextWidth(iiii) in Cambria = %.2f, want 24 (drawn in the Caladea from the font directory)", got)
+	}
+	r.SetFont("Cambria", true, false, false, false, 10)
+	if got := r.TextWidth("iiii"); got == 24 {
+		t.Errorf("TextWidth(iiii) in bold Cambria = %.2f: with no bold Caladea it must fall back to the embedded serif", got)
+	}
+}
+
 func TestFontIndex_FindsInstalledFacesByFamilyAndStyle(t *testing.T) {
 	dir := t.TempDir()
 	for name, data := range map[string][]byte{

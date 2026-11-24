@@ -23,6 +23,8 @@ jobs:
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - run: go vet ./...
       - run: go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+        env:
+          DOCX2PDF_NETWORK_TESTS: "1" # also downloads the font catalog
       - name: coverage
         id: cov
         run: |

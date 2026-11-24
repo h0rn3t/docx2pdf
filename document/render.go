@@ -173,8 +173,8 @@ func (d *Document) WritePDFTo(w io.Writer) error {
 // Converter renders a document to PDF. Create one with ConvertToPdf.
 type Converter struct {
 	doc     *Document
-	system  *fontIndex
-	created time.Time // the PDF's creation date, or zero for the time of writing
+	fonts   []*fontIndex // font directories, searched in the order they were added
+	created time.Time    // the PDF's creation date, or zero for the time of writing
 }
 
 // WithSystemFonts makes the converter draw text in the fonts installed on this
@@ -185,7 +185,24 @@ type Converter struct {
 // used, and a string a font has no glyph for is drawn in the replacement. The
 // output then depends on the machine it is made on.
 func (c *Converter) WithSystemFonts(dirs ...string) *Converter {
-	c.system = newFontIndex(dirs)
+	c.fonts = append(c.fonts, newFontIndex(dirs))
+	return c
+}
+
+// WithFontDir adds dir - typically one fonts.Download filled - to the
+// directories searched for a font the document asks for. A font Word uses
+// that no directory holds is drawn in its open-source stand-in when dir has
+// it (Caladea for Cambria, DejaVu Sans for Verdana; see fonts.Substitute),
+// and otherwise in a bundled replacement. Directories are searched in the
+// order WithFontDir and WithSystemFonts were called; only TrueType files are
+// used.
+//
+//	dir, err := fonts.DefaultDir()
+//	...
+//	if err := fonts.Download(ctx, dir); err != nil { ... } // once, at startup
+//	err = document.ConvertToPdf(doc).WithFontDir(dir).WriteToFile("out.pdf")
+func (c *Converter) WithFontDir(dir string) *Converter {
+	c.fonts = append(c.fonts, newFontIndex([]string{dir}))
 	return c
 }
 
@@ -209,7 +226,7 @@ func (c *Converter) Write(w io.Writer) error {
 	if c.doc != nil {
 		embedded = c.doc.Fonts
 	}
-	r := newFPDFRenderer(g.WidthPt, g.HeightPt, embedded, c.system)
+	r := newFPDFRenderer(g.WidthPt, g.HeightPt, embedded, c.fonts)
 	if !c.created.IsZero() {
 		r.pdf.SetCreationDate(c.created)
 		r.pdf.SetModificationDate(c.created)
