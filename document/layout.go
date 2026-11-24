@@ -40,15 +40,39 @@ type word struct {
 	// hyphenBreak lets a line wrap before the word although no space precedes
 	// it: it follows a hyphen inside a word, as in "інженеру-програмісту".
 	hyphenBreak bool
+	// asc and desc are how far the word's line reaches above and below the
+	// baseline (its font's, short of a picture's); fontLine is its font's
+	// line height, which a multiple line spacing takes its share of.
+	asc, desc, fontLine float64
+	// math is the laid-out equation the word draws instead of text.
+	math *mathBox
+	// box is the laid-out text box the word draws instead of text; like a
+	// picture, it sits on the baseline.
+	box *textBoxLayout
 }
 
-// height is what the word contributes to its line's height: a picture's full
-// height, or (for text) zero - text height comes from the line's font size.
+// height is what the word contributes to its line's height above the
+// baseline: a picture's full height, an equation's ascent, or (for text) zero
+// - text height comes from the line's font size.
 func (w word) height() float64 {
-	if w.img == nil {
+	switch {
+	case w.img != nil:
+		return w.img.HeightPt
+	case w.math != nil:
+		return w.math.asc
+	case w.box != nil:
+		return w.box.h
+	}
+	return 0
+}
+
+// depth is how far the word reaches below the baseline beyond what its text
+// would: an equation's descent (a fraction's denominator, say).
+func (w word) depth() float64 {
+	if w.math == nil {
 		return 0
 	}
-	return w.img.HeightPt
+	return w.math.desc
 }
 
 // frameBreak is an explicit break that moves what follows it to a new frame.
@@ -64,27 +88,28 @@ const (
 type line struct {
 	words   []word
 	natural float64 // words plus their internal gaps
-	maxSize float64 // tallest run size on the line
-	maxImg  float64 // tallest inline image on the line (0 when text-only)
-	height  float64 // vertical advance
+	// ascent and descent are how far the line's fonts reach above and below
+	// its baseline.
+	ascent, descent float64
+	maxImg          float64 // tallest inline image on the line (0 when text-only)
+	height          float64 // vertical advance
 	// breakBefore moves this line to the next page or column; only a flowing
 	// paragraph acts on it - a table cell or header draws it as a plain line.
 	breakBefore frameBreak
 }
 
 // lineHeightFor computes a line's vertical advance from the paragraph's
-// resolved line spacing. The natural single-spaced height of a line is its
-// tallest run size times the default multiplier (lineSpacing), floored at the
-// tallest inline image so a picture is never clipped by the line it sits on;
-// OOXML's "auto" rule counts that natural height in lines (w:line ÷ 240), so a
-// multiple scales the natural height rather than the bare font size. Exact fixes
-// the height; at-least floors it at the natural height; single uses the natural
-// height.
-func lineHeightFor(maxSize, maxImg float64, sp Spacing) float64 {
-	natural := math.Max(maxSize*lineSpacing, maxImg)
+// resolved line spacing. natural is the line's single-spaced height: its
+// fonts' line height (font), or more for an inline picture (maxImg tall) or
+// an equation on it. OOXML's "auto" rule counts lines (w:line ÷ 240): a
+// multiple adds that share of the font's line height below the text, so a
+// picture is not stretched (LibreOffice's rule, which Word's output matches).
+// Exact fixes the height (never below a picture); at-least floors it at the
+// natural height; single uses the natural height.
+func lineHeightFor(natural, font, maxImg float64, sp Spacing) float64 {
 	switch sp.LineRule {
 	case LineSpacingMultiple:
-		return natural * sp.LineValue
+		return twips(max(natural+(sp.LineValue-1)*font, 0))
 	case LineSpacingExact:
 		return math.Max(sp.LineValue, maxImg)
 	case LineSpacingAtLeast:
@@ -141,21 +166,28 @@ func (b *lineBreaker) next(width float64) (line, bool) {
 		width -= b.props.Indent.FirstLineOffsetPt
 	}
 	var cur []word
-	var curW, curMax, curImg float64
+	var curW, curAsc, curDesc, curImg, curFont float64
+	// tabAsc and the rest are the tabs' font metrics, which size a line only
+	// when it holds nothing else: Word does not raise a line for a tab.
+	var tabAsc, tabDesc, tabFont float64
 	flush := func() line {
+		if curAsc == 0 && curImg == 0 {
+			curAsc, curDesc, curFont = tabAsc, max(curDesc, tabDesc), tabFont
+		}
 		ln := line{
 			words:       cur,
 			natural:     curW,
-			maxSize:     curMax,
+			ascent:      curAsc,
+			descent:     curDesc,
 			maxImg:      curImg,
-			height:      lineHeightFor(curMax, curImg, b.props.Spacing),
+			height:      lineHeightFor(max(curAsc, curImg)+curDesc, curFont, curImg, b.props.Spacing),
 			breakBefore: b.pending,
 		}
 		b.pending, b.started = breakNone, true
 		return ln
 	}
 	blankLine := func() line {
-		ln := line{height: lineHeightFor(defaultRenderSizePt, 0, b.props.Spacing), breakBefore: b.pending}
+		ln := line{height: emptyLineHeight(b.r, b.props), breakBefore: b.pending}
 		b.pending, b.started = breakNone, true
 		return ln
 	}
@@ -208,7 +240,11 @@ func (b *lineBreaker) next(width float64) (line, bool) {
 		}
 		if words[i].tab {
 			after, toDecimal := segmentWidths(b.r, words[end:])
-			unitW, leader = tabAdvance(b.props, lineStart+curW+gap, after, toDecimal)
+			var reach float64
+			unitW, leader, reach = tabAdvance(b.props, lineStart+curW+gap, after, toDecimal)
+			// Word lets the text run into the right margin up to a custom stop
+			// set beyond it rather than wrapping (LibreOffice's TabOverMargin).
+			width = max(width, reach-lineStart)
 		}
 		// A stop on the right margin (9355 dxa of a 9355 dxa column) is the
 		// column's width give or take a rounding error of the twip-to-point
@@ -225,7 +261,13 @@ func (b *lineBreaker) next(width float64) (line, bool) {
 			}
 			cur = append(cur, w)
 			curW += w.gap + w.width
-			curMax = math.Max(curMax, w.props.SizePt)
+			if w.tab {
+				tabAsc, tabDesc, tabFont = max(tabAsc, w.asc), max(tabDesc, w.desc), max(tabFont, w.fontLine)
+			} else {
+				curAsc = math.Max(curAsc, w.asc)
+				curFont = math.Max(curFont, w.fontLine)
+				curDesc = max(curDesc, w.desc, w.depth())
+			}
 			curImg = math.Max(curImg, w.height())
 		}
 		b.hardStart = false
@@ -252,21 +294,25 @@ const fitTolerancePt = 0.01
 // a right or centered stop, or the text up to its decimal separator
 // (toDecimal) for a decimal one; with neither, to the next stop of the
 // document's default tab grid. Bar stops are skipped: they only draw a rule.
-// It also returns the leader the stop fills the span with.
-func tabAdvance(pp ParagraphProperties, x, after, toDecimal float64) (float64, string) {
+// It also returns the leader the stop fills the span with, and reach: the
+// position of the custom stop used, the text after which may extend that far
+// even past the column's edge (0 for an implicit stop).
+func tabAdvance(pp ParagraphProperties, x, after, toDecimal float64) (adv float64, leader string, reach float64) {
 	const eps = 0.01 // a stop the pen is already on does not count
 	next := TabStop{PosPt: math.Inf(1)}
 	if i := slices.IndexFunc(pp.Tabs, func(s TabStop) bool { return s.Align != TabBar && s.PosPt > x+eps }); i >= 0 {
 		next = pp.Tabs[i]
+		reach = next.PosPt
 	}
 	if ind := pp.Indent; ind.FirstLineOffsetPt < 0 && ind.LeftPt > x+eps && ind.LeftPt < next.PosPt {
 		next = TabStop{PosPt: ind.LeftPt}
+		reach = 0
 	}
 	if math.IsInf(next.PosPt, 1) {
 		step := cmp.Or(pp.DefaultTabStopPt, defaultTabStopPt)
 		next = TabStop{PosPt: (math.Floor((x+eps)/step) + 1) * step}
 	}
-	adv := next.PosPt - x
+	adv = next.PosPt - x
 	switch next.Align {
 	case TabRight:
 		adv -= after
@@ -276,7 +322,7 @@ func tabAdvance(pp ParagraphProperties, x, after, toDecimal float64) (float64, s
 		adv -= after / 2
 	case TabLeft, TabBar:
 	}
-	return math.Max(adv, 0), next.Leader
+	return math.Max(adv, 0), next.Leader, reach
 }
 
 // segmentWidths measures the words up to the next tab or break - the text a
@@ -370,7 +416,7 @@ func drawLine(r renderer, ln line, align Alignment, x0, width, y float64, isLast
 	// An inline image sits on the baseline like a glyph, so a line taller than
 	// its text pushes the baseline down to the image's foot rather than letting
 	// the picture overflow the line box upward.
-	baseline := y + math.Max(ln.maxSize, ln.maxImg)
+	baseline := y + math.Max(ln.ascent, ln.maxImg)
 	placed := make([]float64, len(ln.words)) // each word's x, so shading can be drawn under it
 	stretch := stretchable(ln)
 	for i, w := range ln.words {
@@ -396,12 +442,19 @@ func drawLine(r renderer, ln line, align Alignment, x0, width, y float64, isLast
 		if i > 0 && ln.words[i-1].props.Shading == w.props.Shading && ln.words[i-1].img == nil {
 			left = placed[i-1] + ln.words[i-1].width
 		}
-		top := baseline - w.props.SizePt
-		r.FillRect(left, top, placed[i]+w.width-left, w.props.SizePt*lineSpacing, w.props.Shading)
+		r.FillRect(left, baseline-w.asc, placed[i]+w.width-left, w.asc+w.desc, w.props.Shading)
 	}
 	for i, w := range ln.words {
 		if w.img != nil {
 			drawPicture(r, w.img, placed[i], baseline-w.img.HeightPt)
+			continue
+		}
+		if w.math != nil {
+			w.math.paint(r, placed[i], baseline)
+			continue
+		}
+		if w.box != nil {
+			w.box.draw(r, placed[i], baseline-w.box.h)
 			continue
 		}
 		if w.tab {
@@ -428,9 +481,9 @@ func drawLinks(r renderer, ln line, placed []float64, y, baseline float64) {
 		if link != "" {
 			top := y
 			for _, w := range ln.words[i:j] {
-				top = math.Min(top, baseline-math.Max(w.props.SizePt, w.height()))
+				top = math.Min(top, baseline-math.Max(w.asc, w.height()))
 			}
-			r.Link(placed[i], top, placed[j-1]+ln.words[j-1].width-placed[i], baseline+ln.maxSize*(lineSpacing-1)-top, link)
+			r.Link(placed[i], top, placed[j-1]+ln.words[j-1].width-placed[i], baseline+ln.descent-top, link)
 		}
 		i = j
 	}
@@ -526,18 +579,31 @@ func measureWords(r renderer, p Paragraph) []word {
 			words = append(words, w)
 			pendingGap = 0
 			continue
+		}
+		// Whatever the run draws, its line is at least as tall as its font's.
+		base := word{props: run.Props, gap: pendingGap, link: run.Link}
+		base.asc, base.desc = fontExtent(r, run.Props)
+		base.fontLine = base.asc + base.desc
+		switch {
 		case run.Tab:
-			words = append(words, word{tab: true, props: run.Props, gap: pendingGap, link: run.Link})
-			pendingGap = 0
-			continue
+			base.tab = true
+		case run.TextBox != nil:
+			box := layoutTextBox(r, *run.TextBox)
+			base.box, base.width = &box, box.w
+		case run.Math != nil:
+			box := layoutMath(r, run.Math, run.Props)
+			base.math, base.width = &box, box.w
 		case run.Image != nil:
-			words = append(words, word{
-				img:   run.Image,
-				props: run.Props,
-				width: math.Max(run.Image.WidthPt, run.MinWidthPt),
-				gap:   pendingGap,
-				link:  run.Link,
-			})
+			base.img, base.width = run.Image, math.Max(run.Image.WidthPt, run.MinWidthPt)
+		}
+		if h := base.height(); base.img != nil || base.box != nil {
+			// A picture stands on the baseline and fills the line down to
+			// the font's bottom only as far as it is shorter than the font's
+			// line: Word adds no descent below a taller one.
+			base.desc = max(base.asc+base.desc-max(base.asc, h), 0)
+		}
+		if base.tab || base.box != nil || base.math != nil || base.img != nil {
+			words = append(words, base)
 			pendingGap = 0
 			continue
 		}
@@ -548,7 +614,8 @@ func measureWords(r renderer, p Paragraph) []word {
 				continue
 			}
 			for j, part := range splitAfterHyphens(tok.text) {
-				w := word{text: part, props: run.Props, width: r.TextWidth(part), gap: pendingGap, field: run.Field, link: run.Link}
+				w := base
+				w.text, w.width, w.gap, w.field = part, r.TextWidth(part), pendingGap, run.Field
 				if i == 0 && j == 0 { // the run's advance floor applies to its first token (a list marker is one)
 					w.width = math.Max(w.width, run.MinWidthPt)
 					w.note = run.Note
@@ -562,6 +629,30 @@ func measureWords(r renderer, p Paragraph) []word {
 		}
 	}
 	return words
+}
+
+// twips rounds v to whole twips (1/20 pt), the unit Word and LibreOffice lay
+// out in: a font's 16.0986pt line is 322 twips, 16.1pt, in both.
+func twips(v float64) float64 { return math.Round(v*20) / 20 }
+
+// emptyLineHeight is the height of an empty line of a paragraph: one line of
+// its mark's font.
+func emptyLineHeight(r renderer, pp ParagraphProperties) float64 {
+	mark := pp.Mark
+	if mark.SizePt <= 0 {
+		mark.SizePt = defaultRenderSizePt
+	}
+	setRunFont(r, mark)
+	_, h := r.FontMetrics()
+	return lineHeightFor(h, h, 0, pp.Spacing)
+}
+
+// fontExtent is how far a line of the run's font reaches above and below the
+// baseline.
+func fontExtent(r renderer, props RunProperties) (asc, desc float64) {
+	setRunFont(r, props)
+	asc, h := r.FontMetrics()
+	return asc, h - asc
 }
 
 // setRunFont makes the run's font and character spacing the renderer's.

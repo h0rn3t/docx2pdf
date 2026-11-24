@@ -220,7 +220,7 @@ func TestLayoutTable_MergedCellGrowsTheRowsItSpans(t *testing.T) {
 	}
 	tl := layoutTable(&fakeRenderer{}, tbl, contentWidthPt, contentHeightPt)
 
-	want := 4 * lineHeightFor(12, 0, Spacing{}) // the merged cell's four lines
+	want := 4 * 12 * lineSpacing // the merged cell's four lines
 	if got := tl.mergedHeight(0, 0); got < want-0.01 {
 		t.Fatalf("merged height = %.2f, want at least %.2f (the rows must stretch to its content)", got, want)
 	}
@@ -308,7 +308,7 @@ func TestRenderTable_ExactRowClipsItsContent(t *testing.T) {
 // --- Row height (w:trHeight) ---
 
 func TestLayoutTable_RowHeightRules(t *testing.T) {
-	oneLine := lineHeightFor(12, 0, Spacing{})
+	oneLine := 12 * lineSpacing
 	tests := []struct {
 		name   string
 		rule   RowHeightRule
@@ -327,7 +327,7 @@ func TestLayoutTable_RowHeightRules(t *testing.T) {
 			tbl := Table{ColumnWidths: []float64{100}, Rows: []Row{row}}
 
 			tl := layoutTable(&fakeRenderer{}, tbl, contentWidthPt, contentHeightPt)
-			if tl.rows[0].height != tt.want {
+			if !approx(tl.rows[0].height, tt.want) {
 				t.Fatalf("row height = %.2f, want %.2f (one line is %.2f)", tl.rows[0].height, tt.want, oneLine)
 			}
 		})
@@ -343,8 +343,8 @@ func TestRenderTable_VerticalAlignmentMovesTheContentDown(t *testing.T) {
 		want  float64
 	}{
 		{"top", VAlignTop, 0},
-		{"center", VAlignCenter, (60 - lineHeightFor(12, 0, Spacing{})) / 2},
-		{"bottom", VAlignBottom, 60 - lineHeightFor(12, 0, Spacing{})},
+		{"center", VAlignCenter, (60 - 12*lineSpacing) / 2},
+		{"bottom", VAlignBottom, 60 - 12*lineSpacing},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

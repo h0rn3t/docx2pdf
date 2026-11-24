@@ -1,6 +1,9 @@
 package document
 
-import "math"
+import (
+	"math"
+	"slices"
+)
 
 // paraBox is one cell paragraph's wrapped lines plus its alignment, indent,
 // spacing and shading (drawLine needs them all, but a cell's draw pass happens
@@ -14,6 +17,8 @@ type paraBox struct {
 	shading   string
 	tabs      []TabStop
 	bookmarks []string
+	// empty is the height of the paragraph's line when it has none.
+	empty float64
 }
 
 // cellContent is a cell's laid-out paragraphs and nested tables in document
@@ -64,7 +69,26 @@ type cellLayout struct {
 type rowLayout struct {
 	height float64
 	fixed  bool
-	cells  []cellLayout
+	// cantSplit keeps the row on one frame (w:cantSplit).
+	cantSplit bool
+	cells     []cellLayout
+}
+
+// clearOf keeps each side of the margins at least half its border's width,
+// so the content stays clear of the border (LibreOffice's
+// lcl_adjustBorderDistance; Word's rows measure the same).
+func (m CellMargins) clearOf(b CellBorders) CellMargins {
+	half := func(s BorderSide) float64 {
+		if s.Style == "" {
+			return 0
+		}
+		return s.WidthPt / 2
+	}
+	m.TopPt = max(m.TopPt, half(b.Top))
+	m.BottomPt = max(m.BottomPt, half(b.Bottom))
+	m.LeftPt = max(m.LeftPt, half(b.Left))
+	m.RightPt = max(m.RightPt, half(b.Right))
+	return m
 }
 
 // tableLayout is a fully measured table, ready to draw at any x/y origin:
@@ -117,7 +141,7 @@ func layoutTable(r renderer, t Table, availWidth, availHeight float64) tableLayo
 		case AlignRight:
 			start = math.Max(availWidth-tableWidth, 0)
 		case AlignLeft, AlignJustify:
-			// Starts at its indent.
+			start -= t.HangPt
 		}
 	}
 	offsets := make([]float64, len(widths))
@@ -130,7 +154,7 @@ func layoutTable(r renderer, t Table, availWidth, availHeight float64) tableLayo
 
 	for _, row := range t.Rows {
 		col := 0
-		rl := rowLayout{height: minRowHeightPt, fixed: row.HeightRule == RowHeightExact}
+		rl := rowLayout{height: minRowHeightPt, fixed: row.HeightRule == RowHeightExact, cantSplit: row.CantSplit}
 		// Vertical text runs along the row's height, so that is what it wraps at:
 		// a declared height when the row has one, else whatever room the frame
 		// still offers.
@@ -141,7 +165,7 @@ func layoutTable(r renderer, t Table, availWidth, availHeight float64) tableLayo
 		for _, cell := range row.Cells {
 			span := colSpan(cell)
 			width := spanWidth(widths, col, span)
-			margins := cell.Margins.resolve(tableWidth)
+			margins := cell.Margins.resolve(tableWidth).clearOf(cell.Borders)
 
 			var content cellContent
 			if cell.VMerge != VMergeContinue {
@@ -232,9 +256,20 @@ func layoutCellContent(r renderer, cell Cell, m CellMargins, width, wrapLen, ava
 	}
 
 	var cc cellContent
-	for _, el := range cell.blocks() {
+	blocks := cell.blocks()
+	for i, el := range blocks {
+		// The empty paragraph Word requires after a table ending a cell
+		// takes no room.
+		if p := el.Paragraph; i > 0 && i == len(blocks)-1 && blocks[i-1].Table != nil &&
+			p != nil && len(p.Runs) == 0 && len(p.Bookmarks) == 0 {
+			break
+		}
 		if el.Table != nil {
-			nt := layoutTable(r, *el.Table, inner, availHeight)
+			// A nested table starts at its cell's text: Word hangs only a
+			// top-level table out by its cell margin.
+			nested := *el.Table
+			nested.HangPt = 0
+			nt := layoutTable(r, nested, inner, availHeight)
 			cc.items = append(cc.items, cellItem{table: &nt})
 			cc.height += nt.totalHeight
 			continue
@@ -250,9 +285,10 @@ func layoutCellContent(r renderer, cell Cell, m CellMargins, width, wrapLen, ava
 			shading:   p.Props.Shading,
 			tabs:      p.Props.Tabs,
 			bookmarks: p.Bookmarks,
+			empty:     emptyLineHeight(r, p.Props),
 		}})
 		if len(lines) == 0 {
-			cc.height += lineHeightFor(defaultRenderSizePt, 0, p.Props.Spacing)
+			cc.height += emptyLineHeight(r, p.Props)
 			continue
 		}
 		for _, ln := range lines {
@@ -335,10 +371,23 @@ func resolveTableWidths(r renderer, t Table, availWidth float64) []float64 {
 			}
 		}
 	}
-	if target > 0 {
+	switch {
+	case target > 0:
 		scaleToWidth(widths, target)
+	case !t.FixedLayout && sum(widths) > room:
+		// An auto-fit table is narrowed to the room it has, as Word does.
+		scaleToWidth(widths, room)
 	}
 	return widths
+}
+
+// sum is the total of widths.
+func sum(widths []float64) float64 {
+	var s float64
+	for _, w := range widths {
+		s += w
+	}
+	return s
 }
 
 // tableTargetWidth is the width the table declares for itself (w:tblW): a
@@ -584,12 +633,19 @@ func renderTable(f *flow, t Table) {
 		if ri >= tl.headerRows {
 			room -= tl.rowsHeight(0, min(tl.headerRows, len(tl.rows)))
 		}
-		if h := tl.rowsHeight(ri, end); f.y+h > f.frame().bottomLimit && !f.atTop && h <= room {
+		splits := end == ri+1 && tl.splittable(ri)
+		if h := tl.rowsHeight(ri, end); f.y+h > f.frame().bottomLimit && !f.atTop && h <= room && !splits {
 			nextFrame(ri)
 		}
 		for ; ri < end; ri++ {
 			rh := tl.rows[ri].height
 			notes := rowNotes(tl.rows[ri])
+			if splits && f.y+rh > f.frame().bottomLimit && f.notesFit(notes, rh) &&
+				(f.atTop || tl.firstLinesFit(ri, f.frame().bottomLimit-f.y)) {
+				splitRow(f, tl, ri, drawn, nextFrame)
+				f.addNotes(notes)
+				continue
+			}
 			if ri != frameStart && (f.y+rh > f.frame().bottomLimit || !f.notesFit(notes, rh)) && !f.atTop {
 				nextFrame(ri)
 			}
@@ -598,6 +654,77 @@ func renderTable(f *flow, t Table) {
 			f.atTop = false
 			f.addNotes(notes)
 		}
+	}
+}
+
+// splittable reports whether row ri may break across frames: a body row of
+// horizontal text, of no fixed height, not marked w:cantSplit, and not in a
+// vertical merge.
+func (tl tableLayout) splittable(ri int) bool {
+	row := tl.rows[ri]
+	if ri < tl.headerRows || row.fixed || row.cantSplit {
+		return false
+	}
+	for _, cl := range row.cells {
+		if cl.cell.VMerge != VMergeNone || cl.cell.TextDirection != TextDirectionHorizontal {
+			return false
+		}
+	}
+	return true
+}
+
+// firstLinesFit reports whether the first line of every cell of row ri fits
+// in room: Word breaks a row only when some of each cell's text stays above
+// the break.
+func (tl tableLayout) firstLinesFit(ri int, room float64) bool {
+	for _, cl := range tl.rows[ri].cells {
+		if units := cl.content.unitBottoms(); len(units) > 0 && units[0]+cl.margins.TopPt+cl.margins.BottomPt > room {
+			return false
+		}
+	}
+	return true
+}
+
+// splitRow draws row ri across as many frames as it needs: on each, every
+// cell's lines that fit, the rest carried on at the top of the next.
+func splitRow(f *flow, tl tableLayout, ri int, drawn map[[2]int]float64, nextFrame func(int)) {
+	row := tl.rows[ri]
+	for first := true; ; first = false {
+		cells := row.cells
+		// What is left of the row: the tallest cell's remaining content. On
+		// a frame the row carries on to, its top border takes its whole
+		// width above the text, as in Word.
+		rest := row.height
+		if !first {
+			rest = 0
+			cells = slices.Clone(row.cells)
+			for i, cl := range cells {
+				if top := cl.cell.Borders.Top; top.Style != "" {
+					cells[i].margins.TopPt = max(cl.margins.TopPt, top.WidthPt)
+				}
+				m := cells[i].margins
+				rest = max(rest, cl.content.height-drawn[[2]int{ri, cl.col}]+m.TopPt+m.BottomPt)
+			}
+		}
+		bottom := f.frame().bottomLimit
+		last := f.y+rest <= bottom
+		height := rest
+		if !last {
+			height = bottom - f.y
+		}
+		cut := &pageCut{bottom: bottom, drawn: drawn}
+		for _, cl := range cells {
+			x := f.frame().originX + tl.colOffsets[cl.col]
+			width := spanWidth(tl.colWidths, cl.col, colSpan(cl.cell))
+			win := cut.window(cl, [2]int{ri, cl.col}, height, !last)
+			drawCellBox(f.r, cl, x, f.y, width, height, !last, win)
+		}
+		f.y += height
+		f.atTop = false
+		if last {
+			return
+		}
+		nextFrame(ri)
 	}
 }
 
@@ -832,7 +959,7 @@ func (c cellContent) unitBottoms() []float64 {
 			y += it.table.totalHeight
 			out = append(out, y)
 		case len(it.para.lines) == 0:
-			y += lineHeightFor(defaultRenderSizePt, 0, it.para.spacing)
+			y += it.para.empty
 			out = append(out, y)
 		default:
 			for _, ln := range it.para.lines {
@@ -932,7 +1059,7 @@ func drawCellContent(r renderer, cl cellLayout, x, y, width, height float64, win
 		}
 		pb := it.para
 		if len(pb.lines) == 0 {
-			pos += lineHeightFor(defaultRenderSizePt, 0, pb.spacing)
+			pos += pb.empty
 			continue
 		}
 		innerX := x + m.LeftPt + pb.indent.LeftPt

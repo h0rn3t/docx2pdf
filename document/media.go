@@ -377,17 +377,28 @@ func emuToPt(s string) float64 {
 // a wp:extent.
 
 type xmlPict struct {
-	Shape *xmlVShape `xml:"urn:schemas-microsoft-com:vml shape"`
-	// Other holds the text boxes of the picture's other shapes (v:rect,
-	// v:roundrect, v:group, …).
+	Shape      *xmlVShape  `xml:"urn:schemas-microsoft-com:vml shape"`
+	Rects      []xmlVShape `xml:"urn:schemas-microsoft-com:vml rect"`
+	RoundRects []xmlVShape `xml:"urn:schemas-microsoft-com:vml roundrect"`
+	// Other holds the text boxes of the picture's other shapes (v:group,
+	// v:oval, …), which flow after the paragraph rather than in a frame.
 	Other []xmlTextBoxes `xml:",any"`
 }
 
+// xmlVShape is a VML shape (v:shape, v:rect, v:roundrect): its CSS-like style
+// (size, position), fill and outline, and its picture or text box.
 type xmlVShape struct {
-	Style     string        `xml:"style,attr"`
-	ImageData *xmlImageData `xml:"urn:schemas-microsoft-com:vml imagedata"`
-	// TextBox holds the shape's v:textbox content.
-	TextBox []xmlTextBoxes `xml:",any"`
+	Style        string        `xml:"style,attr"`
+	FillColor    string        `xml:"fillcolor,attr"`
+	Filled       string        `xml:"filled,attr"`
+	StrokeColor  string        `xml:"strokecolor,attr"`
+	Stroked      string        `xml:"stroked,attr"`
+	StrokeWeight string        `xml:"strokeweight,attr"`
+	ImageData    *xmlImageData `xml:"urn:schemas-microsoft-com:vml imagedata"`
+	TextBox      *xmlVTextBox  `xml:"urn:schemas-microsoft-com:vml textbox"`
+	Fill         *xmlVFill     `xml:"urn:schemas-microsoft-com:vml fill"`
+	Stroke       *xmlVStroke   `xml:"urn:schemas-microsoft-com:vml stroke"`
+	Wrap         *xmlVWrap     `xml:"urn:schemas-microsoft-com:office:word wrap"`
 }
 
 // xmlTextBoxes collects the content of every text box (w:txbxContent) inside
@@ -419,14 +430,10 @@ func (tb *xmlTextBoxes) UnmarshalXML(d *xml.Decoder, _ xml.StartElement) error {
 	}
 }
 
-// textBoxes is the content of the picture's text boxes, in document order.
+// textBoxes is the content of the text boxes of the picture's shapes that are
+// not drawn as a TextBox of their own (a group's, say), in document order.
 func (p *xmlPict) textBoxes() []xmlBodyChild {
 	var blocks []xmlBodyChild
-	if p.Shape != nil {
-		for _, tb := range p.Shape.TextBox {
-			blocks = append(blocks, tb.Blocks...)
-		}
-	}
 	for _, tb := range p.Other {
 		blocks = append(blocks, tb.Blocks...)
 	}
@@ -434,9 +441,10 @@ func (p *xmlPict) textBoxes() []xmlBodyChild {
 }
 
 // shows reports whether the picture draws anything this package renders: an
-// image or a text box.
+// image, a text box or a rectangle.
 func (p *xmlPict) shows() bool {
-	return p.Shape != nil && p.Shape.ImageData != nil || len(p.textBoxes()) > 0
+	return p.Shape != nil && (p.Shape.ImageData != nil || p.Shape.TextBox != nil) ||
+		len(p.Rects)+len(p.RoundRects) > 0 || len(p.textBoxes()) > 0
 }
 
 type xmlImageData struct {
@@ -509,6 +517,7 @@ type xmlAnchor struct {
 	// the page's corner, when the simplePos attribute is on) or positionH/V; the
 	// clearance the text keeps (EMU); and the wrap.
 	SimplePosOn      string       `xml:"simplePos,attr"`
+	BehindDoc        string       `xml:"behindDoc,attr"`
 	DistT            string       `xml:"distT,attr"`
 	DistB            string       `xml:"distB,attr"`
 	DistL            string       `xml:"distL,attr"`
@@ -561,6 +570,7 @@ func (a xmlAnchor) float() *Float {
 	switch {
 	case a.WrapNone != nil:
 		fl.Wrap = WrapNone
+		fl.InFront = a.BehindDoc == "" || !(&xmlOnOff{Val: a.BehindDoc}).on()
 	case a.WrapTopAndBottom != nil:
 		fl.Wrap = WrapTopAndBottom
 	}
@@ -587,11 +597,12 @@ type xmlGraphic struct {
 	Data xmlGraphicData `xml:"http://schemas.openxmlformats.org/drawingml/2006/main graphicData"`
 }
 
-// xmlGraphicData holds the graphic's payload: a picture (pic:pic), or the text
-// boxes of a shape or group of shapes. Charts and diagrams decode to neither and
-// are skipped.
+// xmlGraphicData holds the graphic's payload: a picture (pic:pic), a shape
+// (wps:wsp), or the text boxes of a group of shapes. Charts and diagrams decode
+// to none of them and are skipped.
 type xmlGraphicData struct {
 	Pic    *xmlPic        `xml:"http://schemas.openxmlformats.org/drawingml/2006/picture pic"`
+	Wsp    *xmlWsp        `xml:"http://schemas.microsoft.com/office/word/2010/wordprocessingShape wsp"`
 	Shapes []xmlTextBoxes `xml:",any"`
 }
 
@@ -691,7 +702,8 @@ func (d *xmlDrawing) image(ir *imageResolver) *Image {
 	return nil
 }
 
-// textBoxes is the content of the drawing's text boxes, in document order.
+// textBoxes is the content of the text boxes of the drawing's shape groups,
+// which are not drawn as a TextBox of their own, in document order.
 func (d *xmlDrawing) textBoxes() []xmlBodyChild {
 	var blocks []xmlBodyChild
 	for _, a := range slices.Concat(d.Inline, d.Anchor) {
@@ -706,7 +718,7 @@ func (d *xmlDrawing) textBoxes() []xmlBodyChild {
 // picture or a text box.
 func (d *xmlDrawing) shows() bool {
 	for _, a := range slices.Concat(d.Inline, d.Anchor) {
-		if a.Graphic.Data.Pic != nil {
+		if a.Graphic.Data.Pic != nil || a.Graphic.Data.Wsp != nil {
 			return true
 		}
 	}

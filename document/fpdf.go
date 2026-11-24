@@ -50,6 +50,9 @@ type fpdfRenderer struct {
 type realFace struct {
 	name string
 	font *sfnt.Font
+	// ascent and height are its line metrics in ems (fontLineMetrics); a
+	// zero height when the font does not declare them.
+	ascent, height float64
 }
 
 type fontRequest struct {
@@ -94,7 +97,8 @@ func (r *fpdfRenderer) register(data []byte) *realFace {
 	}
 	name := fmt.Sprintf("real-%d", len(r.faces))
 	r.pdf.AddUTF8FontFromBytes(name, "", data)
-	return &realFace{name: name, font: font}
+	asc, h, _ := fontLineMetrics(data)
+	return &realFace{name: name, font: font, ascent: asc, height: h}
 }
 
 // fpdfAccepts tries a font on a throwaway document. fpdf takes only TrueType
@@ -203,6 +207,24 @@ func (r *fpdfRenderer) SetTextColor(colorHex string) {
 }
 
 func (r *fpdfRenderer) SetCharSpacing(pt float64) { r.spacing = pt }
+
+// FontMetrics is the line metrics of the font text in the requested family is
+// drawn in: its real font, else its replacement.
+func (r *fpdfRenderer) FontMetrics() (ascent, height float64) {
+	c := r.cur
+	var ok bool
+	if f := r.face(c.family, c.bold, c.italic); f != nil && f.height > 0 {
+		ascent, height, ok = f.ascent, f.height, true
+	} else if m, sym := symbolMetrics[strings.ToLower(strings.TrimSpace(c.family))]; sym {
+		ascent, height, ok = m[0], m[1], true
+	} else {
+		ascent, height, ok = fontLineMetrics(fonts.Bytes(mapFontFamily(c.family), c.bold, c.italic))
+	}
+	if !ok {
+		ascent, height = 1, lineSpacing
+	}
+	return twips(ascent * c.size), twips(height * c.size)
+}
 
 func (r *fpdfRenderer) TextWidth(s string) float64 {
 	s = r.selectFont(s)

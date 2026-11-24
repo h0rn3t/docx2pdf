@@ -12,6 +12,16 @@ var symbolChars = map[string]map[rune]string{
 	"wingdings": wingdingsChars,
 }
 
+// symbolMetrics are the line metrics (fontLineMetrics' ascent and height, in
+// ems) of the symbol fonts as Word has them, for a line set in one without the
+// font itself: its stand-in's would make the line shorter than Word's.
+var symbolMetrics = map[string][2]float64{
+	"symbol":      {1.0054, 1.2251},
+	"wingdings":   {0.8989, 1.1099},
+	"wingdings 2": {0.8433, 1.0542},
+	"wingdings 3": {0.9277, 1.1387},
+}
+
 // wingdingsChars are the Wingdings pictograms Word documents use most - list
 // bullets and check boxes. A checked box has no stand-in in the replacement
 // font and is drawn filled.

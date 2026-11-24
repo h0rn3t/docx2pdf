@@ -110,6 +110,28 @@ func TestRunStyle_InlineWinsOverStyle(t *testing.T) {
 	}
 }
 
+// A paragraph without w:pStyle, or naming an unknown one, takes the style
+// marked w:default="1" (Word's Normal), which wins over w:docDefaults.
+func TestParaStyle_DefaultStyleAppliesWithoutPStyle(t *testing.T) {
+	styles := docxtest.Styles(`
+		<w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val="22"/></w:rPr></w:rPrDefault></w:docDefaults>
+		<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:rPr><w:sz w:val="28"/></w:rPr></w:style>`)
+	tests := []struct {
+		name, body string
+	}{
+		{"no pStyle", `<w:p><w:r><w:t>x</w:t></w:r></w:p>`},
+		{"unknown pStyle", `<w:p><w:pPr><w:pStyle w:val="Missing"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p>`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc := mustOpenWith(t, tt.body, map[string]string{"word/styles.xml": styles})
+			if got := paragraphs(t, doc)[0].Runs[0].Props.SizePt; got != 14 {
+				t.Errorf("Open(%s) run size = %v, want 14 (from default style sz=28)", tt.body, got)
+			}
+		})
+	}
+}
+
 // --- Theme colors (A3) ---
 
 func TestColor_ThemeReferenceResolvesToHex(t *testing.T) {

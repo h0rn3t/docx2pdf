@@ -1,6 +1,7 @@
 package document_test
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -197,7 +198,9 @@ func TestContextualSpacing(t *testing.T) {
 	tests := []struct {
 		name string
 		body string
-		// want is each paragraph's {before, after} spacing, in points.
+		// want is each paragraph's {before, after} spacing, in points. A
+		// paragraph's space before is what is left of it past the space
+		// after the one above: Word separates them by the larger of the two.
 		want [][2]float64
 	}{
 		{
@@ -208,12 +211,12 @@ func TestContextualSpacing(t *testing.T) {
 		{
 			name: "different style",
 			body: para("List", "a") + para("Plain", "b"),
-			want: [][2]float64{{10, 10}, {10, 10}},
+			want: [][2]float64{{10, 10}, {0, 10}},
 		},
 		{
 			name: "only own flag counts",
 			body: para("Plain", "a") + para("Plain", "b"),
-			want: [][2]float64{{10, 10}, {10, 10}},
+			want: [][2]float64{{10, 10}, {0, 10}},
 		},
 		{
 			name: "inline flag off",
@@ -317,12 +320,18 @@ func vmlTextBox(text string) string {
 		`<w:p><w:r><w:t>` + text + `</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict>`
 }
 
-// bodyTexts is the text of every body paragraph, in order.
-func bodyTexts(t *testing.T, doc *document.Document) []string {
-	t.Helper()
+// boxTexts is the text of the paragraphs of each text box among runs.
+func boxTexts(runs []document.Run) []string {
 	var texts []string
-	for _, p := range paragraphs(t, doc) {
-		texts = append(texts, strings.Join(runTexts(p), ""))
+	for _, r := range runs {
+		if r.TextBox == nil {
+			continue
+		}
+		for _, el := range r.TextBox.Content {
+			if el.Paragraph != nil {
+				texts = append(texts, strings.Join(runTexts(*el.Paragraph), ""))
+			}
+		}
 	}
 	return texts
 }
@@ -337,32 +346,35 @@ func TestTextBox(t *testing.T) {
 			name: "choice is used, fallback ignored",
 			run: `<mc:AlternateContent ` + mcNS + `><mc:Choice Requires="wps">` + wpsTextBox("new") +
 				`</mc:Choice><mc:Fallback>` + vmlTextBox("old") + `</mc:Fallback></mc:AlternateContent>`,
-			want: []string{"before", "new"},
+			want: []string{"new"},
 		},
 		{
 			name: "empty choice falls back",
 			run: `<mc:AlternateContent ` + mcNS + `><mc:Choice Requires="wpc"><w:drawing/></mc:Choice>` +
 				`<mc:Fallback>` + vmlTextBox("old") + `</mc:Fallback></mc:AlternateContent>`,
-			want: []string{"before", "old"},
+			want: []string{"old"},
 		},
 		{
 			name: "bare drawing",
 			run:  wpsTextBox("box"),
-			want: []string{"before", "box"},
+			want: []string{"box"},
 		},
 		{
 			name: "bare VML",
 			run:  vmlTextBox("box"),
-			want: []string{"before", "box"},
+			want: []string{"box"},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			doc := mustOpen(t, `<w:p><w:r><w:t>before</w:t>`+tt.run+`</w:r></w:p>`)
 
-			got := bodyTexts(t, doc)
-			if len(got) != len(tt.want) || got[0] != tt.want[0] || got[1] != tt.want[1] {
-				t.Errorf("paragraph texts = %q, want %q", got, tt.want)
+			paras := paragraphs(t, doc)
+			if len(paras) != 1 {
+				t.Fatalf("%d body paragraphs, want the anchor alone: the box's text is the box's own", len(paras))
+			}
+			if got := boxTexts(paras[0].Runs); !slices.Equal(got, tt.want) {
+				t.Errorf("text box texts = %q, want %q", got, tt.want)
 			}
 		})
 	}
@@ -373,8 +385,8 @@ func TestTextBox_InTableCell(t *testing.T) {
 	doc := mustOpen(t, body)
 
 	paras := singleTable(t, doc).Rows[0].Cells[0].Paragraphs
-	if len(paras) != 2 || len(paras[1].Runs) != 1 || paras[1].Runs[0].Text != "boxed" {
-		t.Errorf("cell paragraphs = %+v, want the anchor paragraph then \"boxed\"", paras)
+	if len(paras) != 1 || !slices.Equal(boxTexts(paras[0].Runs), []string{"boxed"}) {
+		t.Errorf("cell paragraphs = %+v, want the anchor paragraph holding the \"boxed\" text box", paras)
 	}
 }
 
@@ -384,8 +396,8 @@ func TestTextBox_SectionBreakStaysAfterIt(t *testing.T) {
 		`<w:sectPr><w:pgSz w:w="15840" w:h="12240"/></w:sectPr>`
 	doc := mustOpen(t, body)
 
-	if len(doc.Sections) != 2 || doc.Sections[0].End != 2 {
-		t.Errorf("sections = %+v, want the first to end after the anchor paragraph and its box (2)", doc.Sections)
+	if len(doc.Sections) != 2 || doc.Sections[0].End != 1 {
+		t.Errorf("sections = %+v, want the first to end after the anchor paragraph (1)", doc.Sections)
 	}
 }
 

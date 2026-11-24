@@ -76,6 +76,12 @@ func TestOpen_AnchoredPictureIsFloating(t *testing.T) {
 			name:     "simple position, no wrap",
 			attrs:    `simplePos="1"`,
 			children: `<wp:simplePos x="635000" y="1270000"/><wp:wrapNone/>`,
+			want:     Float{XPt: 50, YPt: 100, HorzAnchor: AnchorPage, VertAnchor: AnchorPage, Wrap: WrapNone, InFront: true},
+		},
+		{
+			name:     "no wrap, behind the text",
+			attrs:    `simplePos="1" behindDoc="1"`,
+			children: `<wp:simplePos x="635000" y="1270000"/><wp:wrapNone/>`,
 			want:     Float{XPt: 50, YPt: 100, HorzAnchor: AnchorPage, VertAnchor: AnchorPage, Wrap: WrapNone},
 		},
 	}

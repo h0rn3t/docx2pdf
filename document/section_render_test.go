@@ -64,7 +64,7 @@ func repeatParas(n int, text string) []Paragraph {
 // linesPerFrame is how many 12 pt lines fit between the top margin and the
 // bottom limit of the default page.
 func linesPerFrame() int {
-	h := lineHeightFor(12, 0, Spacing{})
+	h := 12 * lineSpacing
 	return int((testPage.bottomLimit - testPage.originY) / h)
 }
 
@@ -238,7 +238,7 @@ func TestHeaderFooter_PositionedAtTheirOffsets(t *testing.T) {
 	}
 	// The footer's single line ends at its distance from the bottom edge.
 	ftr := drawsOf(f, "FTR")[0]
-	lineH := lineHeightFor(12, 0, Spacing{})
+	lineH := 12 * lineSpacing
 	if want := testGeometry.HeightPt - 36 - lineH + 12; ftr.y != want {
 		t.Errorf("footer baseline y = %.2f, want %.2f (its foot 36 pt above the page bottom)", ftr.y, want)
 	}
@@ -303,7 +303,7 @@ func TestParagraphShading_FillsTheIndentedLineBox(t *testing.T) {
 	if want := contentWidthPt - 36 - 18; fill.w != want {
 		t.Errorf("fill width = %.2f, want %.2f (the indented text area)", fill.w, want)
 	}
-	if want := lineHeightFor(12, 0, Spacing{}); fill.h != want {
+	if want := 12 * lineSpacing; !approx(fill.h, want) {
 		t.Errorf("fill height = %.2f, want the line height %.2f", fill.h, want)
 	}
 }

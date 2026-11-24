@@ -5,7 +5,8 @@ import (
 )
 
 const (
-	// lineSpacing multiplies a line's tallest font size to get its box height.
+	// lineSpacing is the line height, in font sizes, of a font whose own
+	// metrics are unknown.
 	lineSpacing = 1.2
 
 	// minRowHeightPt floors a table row's height so an all-empty or
@@ -48,6 +49,9 @@ type renderer interface {
 	SetTextColor(colorHex string)
 	// TextWidth measures s in the active font, in points.
 	TextWidth(s string) float64
+	// FontMetrics reports the active font's single line height and how far
+	// below a line's top its baseline sits, in points.
+	FontMetrics() (ascent, height float64)
 	// AddPage starts a new page of the given size and makes it current. Pages
 	// are sized per section, so a document whose sections differ (say a
 	// landscape one) gets pages of different sizes.

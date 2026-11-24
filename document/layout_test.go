@@ -34,6 +34,9 @@ type fakeRenderer struct {
 	clips     []clipCall
 	links     []linkCall
 	anchors   []anchorCall
+	// ascent and lineHeight are FontMetrics' answers as fractions of the
+	// size; zero means the defaults 1.0 and 1.2.
+	ascent, lineHeight float64
 }
 
 type linkCall struct {
@@ -96,6 +99,13 @@ type pageCall struct {
 
 func (f *fakeRenderer) SetFont(_ string, bold, _, _, _ bool, sizePt float64) {
 	f.bold, f.size = bold, sizePt
+}
+func (f *fakeRenderer) FontMetrics() (ascent, height float64) {
+	a, h := f.ascent, f.lineHeight
+	if a == 0 {
+		a, h = 1, 1.2
+	}
+	return a * f.size, h * f.size
 }
 func (f *fakeRenderer) SetCharSpacing(pt float64)    { f.spacing = pt }
 func (f *fakeRenderer) SetTextColor(colorHex string) { f.color = colorHex }
@@ -212,8 +222,8 @@ func TestLayout_MixedSizeLineHeight(t *testing.T) {
 	if len(lines) != 1 {
 		t.Fatalf("expected a single line, got %d", len(lines))
 	}
-	if lines[0].maxSize != 20 {
-		t.Fatalf("line maxSize = %.1f, want 20 (tallest run)", lines[0].maxSize)
+	if lines[0].ascent != 20 || !approx(lines[0].descent, 4) {
+		t.Fatalf("line ascent, descent = %.1f, %.1f; want 20, 4 (the tallest run's font)", lines[0].ascent, lines[0].descent)
 	}
 	if lines[0].height != 20*lineSpacing {
 		t.Fatalf("line height = %.2f, want %.2f", lines[0].height, 20*lineSpacing)

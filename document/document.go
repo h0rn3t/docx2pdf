@@ -16,6 +16,7 @@ import (
 	"io"
 	"io/fs"
 	pathpkg "path"
+	"slices"
 	"sync"
 )
 
@@ -128,6 +129,33 @@ type Run struct {
 	// Note is the footnote or endnote this run references (Text is its
 	// number), or nil.
 	Note *Note
+	// Math is the equation (m:oMath) this run draws instead of Text, in Props'
+	// size and color; nil for a text run.
+	Math *Math
+	// TextBox is the text box (or rectangle) this run draws instead of Text:
+	// in the line like a picture, or - with a Float - where its anchor puts it.
+	TextBox *TextBox
+}
+
+// TextBox is a text box: a frame with a body of its own (w:txbxContent),
+// drawn like a one-cell table.
+type TextBox struct {
+	Content           []BodyElement
+	WidthPt, HeightPt float64
+	// Fill is the background ("#RRGGBB"), "" for none.
+	Fill string
+	// Border is the outline drawn on all four sides; Style "" for none.
+	Border BorderSide
+	// Insets is the room between the frame and the text.
+	Insets CellMargins
+	// VAlign is where the text sits within the box's height.
+	VAlign VerticalAlign
+	// AutoFit sizes the box's height to its text (Word's "resize shape to fit
+	// text"); otherwise text past its height is cut off.
+	AutoFit bool
+	// Float is the box's placement when it floats (wp:anchor, or a VML shape
+	// positioned absolutely); nil for one that sits in the line.
+	Float *Float
 }
 
 // Font is one face of a font embedded in the document.
@@ -159,6 +187,9 @@ const (
 // ParagraphProperties is the paragraph-level formatting needed for layout.
 type ParagraphProperties struct {
 	Alignment Alignment
+	// Mark is the formatting of the paragraph mark (w:pPr/w:rPr over the
+	// paragraph style): an empty paragraph is one line of its font.
+	Mark RunProperties
 	// PageBreak reports whether an explicit page break precedes this paragraph
 	// (<w:pageBreakBefore/>, or a <w:br w:type="page"/> before any of its
 	// content; a break after content is a Run with PageBreak set).
@@ -310,6 +341,11 @@ type Table struct {
 	// w:tblInd, inline winning over the table's named style). Zero when
 	// neither declares one.
 	IndentPt float64
+	// HangPt is how far a left-aligned table's edge sits left of IndentPt:
+	// Word hangs a table with a declared indent out by its style's left cell
+	// margin (5.4 pt by default), so the first column's text lines up with the
+	// indent.
+	HangPt float64
 	// Alignment places the table in the width available to it (w:jc, inline
 	// winning over the table's named style). A centered or right-aligned table
 	// ignores IndentPt, as Word does; AlignJustify is drawn as AlignLeft.
@@ -378,6 +414,9 @@ type Float struct {
 	// Dist*Pt are the clearance the text keeps from the object on each side
 	// (w:leftFromText and the like, a picture's distL/distR/distT/distB).
 	DistLeftPt, DistRightPt, DistTopPt, DistBottomPt float64
+	// InFront draws an object the text does not wrap around over the text
+	// that follows it on the page, rather than under it.
+	InFront bool
 }
 
 // TableFloat is Float's former name, kept so existing code still compiles.
@@ -407,6 +446,9 @@ type Row struct {
 	// rule is RowHeightAuto when it declares none.
 	HeightPt   float64
 	HeightRule RowHeightRule
+	// CantSplit keeps the row on one page (w:cantSplit); otherwise a row
+	// that does not fit breaks across pages at a line, as in Word.
+	CantSplit bool
 }
 
 // VMergeState is a cell's role in a vertical merge (w:vMerge).
@@ -609,13 +651,16 @@ func build(p *pkg, path string) (*Document, error) {
 	numbering := optionalPart[xmlNumbering](p, numberingName)
 	settings := optionalPart[xmlSettings](p, p.relatedPart(mainName, "settings", pathpkg.Join(dir, "settings.xml")))
 
+	paragraphs, defaultPara := buildParaStyles(xs)
 	sc := styleContext{
-		tables:     buildTableStyles(xs),
-		paragraphs: buildParaStyles(xs),
-		chars:      buildCharStyles(xs),
-		theme:      buildThemeMap(theme),
-		themeFonts: buildThemeFontMap(theme),
-		images:     p.resolverFor(mainName),
+		tables:      buildTableStyles(xs),
+		paragraphs:  paragraphs,
+		defaultPara: defaultPara,
+		hasStyles:   xs != nil,
+		chars:       buildCharStyles(xs),
+		theme:       buildThemeMap(theme),
+		themeFonts:  buildThemeFontMap(theme),
+		images:      p.resolverFor(mainName),
 		// A picture bullet's media is referenced from the numbering part, so it
 		// resolves through that part's own relationships.
 		numbering: newNumberingState(buildNumbering(numbering, p.resolverFor(numberingName))),
@@ -645,6 +690,7 @@ func build(p *pkg, path string) (*Document, error) {
 	body, breaks := buildBody(xdoc.Body, sc)
 	evenAndOdd := settings != nil && settings.EvenAndOddHeaders.on()
 	sections := buildSections(breaks, xdoc.Body.SectPr, len(body), evenAndOdd, p, sc)
+	body = dropSectionMarks(body, sections)
 	doc := &Document{
 		Body:     body,
 		Geometry: sections[0].Geometry,
@@ -655,6 +701,37 @@ func build(p *pkg, path string) (*Document, error) {
 	}
 	doc.Fonts = embeddedFonts(p, p.relatedPart(mainName, "fontTable", pathpkg.Join(dir, "fontTable.xml")))
 	return doc, nil
+}
+
+// dropSectionMarks removes the empty paragraphs that only end a section
+// before a continuous one: Word gives them no room, nor their spacing, and
+// lets the space after the paragraph before them and before the one after
+// them collapse to the larger of the two. The sections' ends follow.
+func dropSectionMarks(body []BodyElement, sections []Section) []BodyElement {
+	for i := len(sections) - 1; i > 0; i-- {
+		end := sections[i-1].End
+		if !sections[i].Continuous || end == 0 || end > len(body) {
+			continue
+		}
+		if mark := body[end-1].Paragraph; mark == nil || !isSectionMark(*mark) {
+			continue
+		}
+		if end < len(body) && end >= 2 && body[end-2].Paragraph != nil && body[end].Paragraph != nil {
+			next := body[end].Paragraph
+			next.Props.Spacing.BeforePt = max(next.Props.Spacing.BeforePt-body[end-2].Paragraph.Props.Spacing.AfterPt, 0)
+		}
+		body = slices.Delete(body, end-1, end)
+		for j := i - 1; j < len(sections); j++ {
+			sections[j].End--
+		}
+	}
+	return body
+}
+
+// isSectionMark reports a paragraph that can only be the mark of a section
+// break: one with no content.
+func isSectionMark(p Paragraph) bool {
+	return len(p.Runs) == 0 && len(p.Bookmarks) == 0
 }
 
 // optionalPart decodes a supporting part (styles, theme, numbering) into T.

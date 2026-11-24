@@ -169,6 +169,8 @@ type xmlParaChild struct {
 	Run       *xmlRun
 	Hyperlink *xmlHyperlink
 	FldSimple *xmlFldSimple
+	// Math is an m:oMath (inline) or m:oMathPara (display) element.
+	Math *xmlNode
 }
 
 func (xp *xmlParagraph) UnmarshalXML(d *xml.Decoder, _ xml.StartElement) error {
@@ -185,6 +187,14 @@ func (xp *xmlParagraph) UnmarshalXML(d *xml.Decoder, _ xml.StartElement) error {
 			if _, end := tok.(xml.EndElement); end {
 				return nil
 			}
+			continue
+		}
+		if start.Name.Space == mathNS && (start.Name.Local == "oMath" || start.Name.Local == "oMathPara") {
+			var n xmlNode
+			if err := d.DecodeElement(&n, &start); err != nil {
+				return err
+			}
+			xp.Items = append(xp.Items, xmlParaChild{Math: &n})
 			continue
 		}
 		if start.Name.Space != wordNS {
@@ -261,6 +271,8 @@ type xmlPPr struct {
 	KeepLines         *xmlOnOff `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main keepLines"`
 	// SectPr is only meaningful on a body paragraph: it ends a section there.
 	SectPr *xmlSectPr `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main sectPr"`
+	// RPr is the formatting of the paragraph mark.
+	RPr *xmlRPr `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main rPr"`
 }
 
 // xmlTabs is <w:tabs>: the paragraph's custom tab stops. A w:tab of
@@ -755,6 +767,7 @@ type xmlRow struct {
 // continues onto (w:tblHeader) and its declared height (w:trHeight).
 type xmlTrPr struct {
 	TblHeader *xmlOnOff    `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main tblHeader"`
+	CantSplit *xmlOnOff    `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main cantSplit"`
 	Height    *xmlTrHeight `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main trHeight"`
 }
 
@@ -871,6 +884,7 @@ type xmlRPrDefault struct {
 type xmlStyle struct {
 	Type        string          `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main type,attr"`
 	StyleID     string          `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main styleId,attr"`
+	Default     string          `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main default,attr"`
 	BasedOn     *xmlVal         `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main basedOn"`
 	TblPr       *xmlTblPr       `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main tblPr"`
 	TcPr        *xmlTcPr        `xml:"http://schemas.openxmlformats.org/wordprocessingml/2006/main tcPr"`
@@ -1275,22 +1289,28 @@ type resolvedParaStyle struct {
 
 // buildParaStyles resolves every paragraph style declared in xs (nil-safe:
 // an absent styles.xml yields an empty map, so callers fall back to inline/
-// docDefaults resolution).
-func buildParaStyles(xs *xmlStyles) map[string]resolvedParaStyle {
+// docDefaults resolution), and reports the id of the style marked
+// w:default="1" (Word's Normal), "" when there is none.
+func buildParaStyles(xs *xmlStyles) (styles map[string]resolvedParaStyle, defaultID string) {
 	resolved := make(map[string]resolvedParaStyle)
 	if xs == nil {
-		return resolved
+		return resolved, ""
 	}
 	defs := make(map[string]xmlStyle)
 	for _, s := range xs.Styles {
-		if strings.EqualFold(s.Type, "paragraph") && s.StyleID != "" {
-			defs[s.StyleID] = s
+		if !strings.EqualFold(s.Type, "paragraph") || s.StyleID == "" {
+			continue
+		}
+		defs[s.StyleID] = s
+		// The first default wins, as in Word.
+		if defaultID == "" && s.Default != "" && (&xmlOnOff{Val: s.Default}).on() {
+			defaultID = s.StyleID
 		}
 	}
 	for id := range defs {
 		resolved[id] = resolveParaStyle(id, defs, resolved, make(map[string]bool))
 	}
-	return resolved
+	return resolved, defaultID
 }
 
 // resolveParaStyle resolves id's own spacing merged over its w:basedOn ancestor
@@ -1524,11 +1544,27 @@ type styleContext struct {
 	// defaultTabPt is word/settings.xml's w:defaultTabStop, in points (0 when
 	// the document declares none).
 	defaultTabPt float64
+	// hasStyles reports a document with a styles part.
+	hasStyles bool
+	// defaultPara is the id of the w:default="1" paragraph style, which a
+	// paragraph without a (known) w:pStyle takes.
+	defaultPara string
 	// footnotes/endnotes number and build the notes the body references (nil
 	// for a document without them, and inside a note); noteMark is the number
 	// of the note being built, which its w:footnoteRef/w:endnoteRef shows.
 	footnotes, endnotes *noteSource
 	noteMark            string
+}
+
+// paraStyleID is the paragraph style pPr applies: its w:pStyle when that names
+// a declared style, else the document's default paragraph style.
+func (sc styleContext) paraStyleID(pPr *xmlPPr) string {
+	if pPr != nil && pPr.PStyle != nil {
+		if _, ok := sc.paragraphs[pPr.PStyle.Val]; ok {
+			return pPr.PStyle.Val
+		}
+	}
+	return sc.defaultPara
 }
 
 // underPPr is the paragraph-property tier beneath the named styles: the table
@@ -1557,6 +1593,8 @@ func buildBody(body xmlBody, sc styleContext) ([]BodyElement, []sectionBreak) {
 	var prev *Paragraph
 	var prevStyle string
 	var prevContextual bool
+	// prevMark reports that prev is an empty paragraph ending a section.
+	var prevMark bool
 	for _, c := range body.Children {
 		switch {
 		case c.Paragraph != nil:
@@ -1570,11 +1608,18 @@ func buildBody(body xmlBody, sc styleContext) ([]BodyElement, []sectionBreak) {
 					p.Props.Spacing.BeforePt = 0
 				}
 			}
+			if prev != nil && !prevMark {
+				// Word separates two paragraphs by the larger of the space
+				// after the first and before the second, not their sum. After
+				// an empty section mark dropSectionMarks does it, past the mark.
+				p.Props.Spacing.BeforePt = max(p.Props.Spacing.BeforePt-prev.Props.Spacing.AfterPt, 0)
+			}
 			if prev != nil && sameBorderBox(prev.Props, p.Props) {
 				prev.Props.Borders.joinNext = true
 				p.Props.Borders.joinPrev = true
 			}
 			prev, prevStyle, prevContextual = &p, style, contextual
+			prevMark = c.Paragraph.Props != nil && c.Paragraph.Props.SectPr != nil && isSectionMark(p)
 			elems = append(elems, BodyElement{Paragraph: &p})
 			// A text box's content follows the paragraph it is anchored in: it is
 			// laid out in the flow rather than in a frame of its own.
@@ -1627,10 +1672,7 @@ func (xp *xmlParagraph) textBoxes() []xmlBodyChild {
 // space before/after next to a paragraph of that same style
 // (w:contextualSpacing: inline → paragraph style → table style → docDefaults).
 func contextualSpacing(pPr *xmlPPr, sc styleContext) (string, bool) {
-	var style string
-	if pPr != nil && pPr.PStyle != nil {
-		style = pPr.PStyle.Val
-	}
+	style := sc.paraStyleID(pPr)
 	on := flagOn(pPr, sc.paragraphs[style].ContextualSpacing, sc.underPPr(),
 		func(pr *xmlPPr) *xmlOnOff { return pr.ContextualSpacing })
 	return style, on
@@ -1653,14 +1695,11 @@ func flagOn(inline *xmlPPr, style *xmlOnOff, under *xmlPPr, field func(*xmlPPr) 
 func buildParagraph(xp xmlParagraph, sc styleContext) Paragraph {
 	var p Paragraph
 	var inlinePPr *xmlPPr
-	var pStyleID string
 	if xp.Props != nil {
 		inlinePPr = xp.Props
 		p.Props.PageBreak = xp.Props.PageBreakBefore.on()
-		if xp.Props.PStyle != nil {
-			pStyleID = xp.Props.PStyle.Val
-		}
 	}
+	pStyleID := sc.paraStyleID(inlinePPr)
 	ps, hasStyle := sc.paragraphs[pStyleID]
 	// under is the tier beneath the named styles: the table style's cell
 	// formatting (inside a table) over w:docDefaults.
@@ -1731,20 +1770,26 @@ func buildParagraph(xp xmlParagraph, sc styleContext) Paragraph {
 	p.Props.KeepNext = flagOn(inlinePPr, ps.KeepNext, under, func(pr *xmlPPr) *xmlOnOff { return pr.KeepNext })
 	p.Props.KeepLines = flagOn(inlinePPr, ps.KeepLines, under, func(pr *xmlPPr) *xmlOnOff { return pr.KeepLines })
 
+	var pStyleRPr *xmlRPr
+	if hasStyle {
+		pStyleRPr = ps.RPr
+	}
+	var markRPr *xmlRPr
+	if inlinePPr != nil {
+		markRPr = inlinePPr.RPr
+	}
+	mark := runRPr(markRPr, pStyleRPr, sc)
+	p.Props.Mark = runPropsFrom(mark, sc)
+
 	// Numbering: prepend a marker run and (when the paragraph declared no
 	// indent) borrow the level's hanging indent.
 	if m, ok := resolveMarker(inlinePPr, ps, hasStyle, sc); ok {
 		if ind == nil {
 			ind = m.ind
 		}
-		p.Runs = append(p.Runs, markerRun(m, indentFrom(ind), sc))
+		p.Runs = append(p.Runs, markerRun(m, indentFrom(ind), mark, sc))
 	}
 	p.Props.Indent = indentFrom(ind)
-
-	var pStyleRPr *xmlRPr
-	if hasStyle {
-		pStyleRPr = ps.RPr
-	}
 	// A page/column break before any content (the list marker aside) belongs to
 	// the paragraph; one after content is a run, so the content before it stays
 	// on the current page.
@@ -1768,10 +1813,42 @@ func buildParagraph(xp xmlParagraph, sc styleContext) Paragraph {
 			}
 		case item.FldSimple != nil:
 			appendSimpleField(&p, *item.FldSimple, pStyleRPr, sc, fld.lead)
+		case item.Math != nil:
+			appendMath(&p, item.Math, runPropsFrom(runRPr(nil, pStyleRPr, sc), sc))
 		}
 	}
 	p.Bookmarks = xp.Bookmarks
 	return p
+}
+
+// appendMath adds an equation to the paragraph: an inline m:oMath as one run,
+// or each equation of an m:oMathPara on a line of its own, aligned as its
+// m:oMathParaPr/m:jc says (centered by default).
+func appendMath(p *Paragraph, n *xmlNode, props RunProperties) {
+	if n.XMLName.Local == "oMath" {
+		p.Runs = append(p.Runs, Run{Math: &Math{root: *n}, Props: props})
+		return
+	}
+	jc, _ := n.prop("oMathParaPr", "jc")
+	switch jc {
+	case "left":
+		p.Props.Alignment = AlignLeft
+	case "right":
+		p.Props.Alignment = AlignRight
+	default: // "center", "centerGroup"
+		p.Props.Alignment = AlignCenter
+	}
+	first := true
+	for _, k := range n.Kids {
+		if k.XMLName.Space != mathNS || k.XMLName.Local != "oMath" {
+			continue
+		}
+		if !first {
+			p.Runs = append(p.Runs, Run{LineBreak: true})
+		}
+		p.Runs = append(p.Runs, Run{Math: &Math{Display: true, root: k}, Props: props})
+		first = false
+	}
 }
 
 // fieldState tracks a complex field (fldChar begin…separate…end) as buildParagraph
@@ -1849,9 +1926,15 @@ func appendRun(p *Paragraph, xr xmlRun, pStyleRPr *xmlRPr, sc styleContext, fld 
 			if img := c.Drawing.image(sc.images); img != nil {
 				p.Runs = append(p.Runs, Run{Image: img, Props: props})
 			}
+			for _, tb := range c.Drawing.boxes(sc) {
+				p.Runs = append(p.Runs, Run{TextBox: tb, Props: props})
+			}
 		case c.Pict != nil:
 			if img := c.Pict.image(sc.images); img != nil {
 				p.Runs = append(p.Runs, Run{Image: img, Props: props})
+			}
+			for _, tb := range c.Pict.boxes(sc) {
+				p.Runs = append(p.Runs, Run{TextBox: tb, Props: props})
 			}
 		case c.Tab:
 			p.Runs = append(p.Runs, Run{Tab: true, Props: props})
@@ -1913,8 +1996,9 @@ func classifyField(instr string) string {
 // its w:suff separator. For the default "tab" suffix the marker's advance is
 // widened to the level's hanging indent, so the text after it starts exactly at
 // the paragraph's left indent - the tab stop Word aligns it to.
-func markerRun(m marker, ind Indent, sc styleContext) Run {
-	props := runPropsFrom(mergeRPr(m.rpr, sc.underRPr()), sc)
+func markerRun(m marker, ind Indent, mark *xmlRPr, sc styleContext) Run {
+	// The marker is set in the paragraph mark's formatting, its level's over it.
+	props := runPropsFrom(mergeRPr(m.rpr, mark), sc)
 	if m.image != nil {
 		r := Run{Image: m.image, Props: props}
 		r.MinWidthPt = markerAdvance(m.suff, ind, sc.defaultTabPt)
@@ -2381,6 +2465,13 @@ func buildTable(xt xmlTable, sc styleContext) Table {
 		HeaderRows:     headerRows,
 		FixedLayout:    fixedLayout,
 	}
+	// Word hangs the table out by its style's left cell margin when an indent
+	// is declared - inline, by the table's style, or by Word's built-in
+	// defaults in a document without a styles part - and the table does not
+	// set its own margin.
+	if (tblInd != nil || !sc.hasStyles) && (inlineCellMar == nil || inlineCellMar.Left == nil) {
+		table.HangPt = resolveCellMargins(tc.style.CellMar).LeftPt
+	}
 	if xt.Props != nil {
 		table.WidthPt, table.WidthPct = tblWidth(xt.Props.TblW)
 		table.Float = tableFloatFrom(xt.Props.Float)
@@ -2480,6 +2571,7 @@ func buildRow(xr xmlRow, tc tableContext, rowIdx int, sc styleContext) Row {
 	row := Row{Cells: cells}
 	if xr.Props != nil {
 		row.Header = xr.Props.TblHeader.on()
+		row.CantSplit = xr.Props.CantSplit.on()
 		row.HeightPt, row.HeightRule = rowHeightFrom(xr.Props.Height)
 	}
 	return row

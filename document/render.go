@@ -313,6 +313,9 @@ type flow struct {
 	// notes are the footnotes referenced on the current page, drawn at its
 	// foot when the page is done; the body's frames end above them.
 	notes []*Note
+	// front draws the floating objects in front of the text on the current
+	// page, once the page's text is drawn.
+	front []func()
 }
 
 func (f *flow) frame() page { return f.sec.cols[f.col] }
@@ -323,6 +326,7 @@ func (f *flow) newPage() {
 	if f.fixed {
 		return
 	}
+	f.drawFront()
 	f.drawNotes()
 	f.r.AddPage(f.sec.sec.Geometry.WidthPt, f.sec.sec.Geometry.HeightPt)
 	f.pageInSection++
@@ -430,6 +434,7 @@ func (c *Converter) renderPass(r renderer, numPages int) {
 			renderElement(f, el)
 		}
 	}
+	f.drawFront()
 	f.drawNotes()
 }
 
@@ -619,7 +624,7 @@ func keepTogether(f *flow, body []BodyElement, i int) {
 func firstLineHeight(r renderer, p Paragraph, width float64) float64 {
 	lines := layoutParagraph(r, p, width-p.Props.Indent.LeftPt-p.Props.Indent.RightPt)
 	if len(lines) == 0 {
-		return lineHeightFor(defaultRenderSizePt, 0, p.Props.Spacing)
+		return emptyLineHeight(r, p.Props)
 	}
 	return lines[0].height
 }
@@ -649,15 +654,20 @@ func renderParagraph(f *flow, p Paragraph) {
 	ind, bdr := p.Props.Indent, p.Props.Borders
 	above, below := bdr.rules()
 	y := f.y
-	f.y += p.Props.Spacing.BeforePt
+	// Word drops the space before a paragraph opening a page the text flowed
+	// or a section broke onto - though not the document's first, nor one a
+	// page break of the paragraph's own starts.
+	if dropBefore := f.atTop && !f.fixed && f.pageNo > 1 && f.col == 0 && !p.Props.PageBreak; !dropBefore {
+		f.y += p.Props.Spacing.BeforePt
+	}
 	if bdr.joinPrev {
 		f.drawSides(bdr, ind, y, f.y) // the box runs on through the spacing
 	}
 
 	p = fillFields(p, f.pageNo, f.numPages)
 	p, floats := splitFloats(p)
-	for _, img := range floats {
-		f.placeFloat(img)
+	for _, run := range floats {
+		f.placeFloat(run)
 	}
 	if above.Style != "" {
 		f.lineSlot(ind, ruleExtent(above))
@@ -670,7 +680,7 @@ func renderParagraph(f *flow, p Paragraph) {
 	laidOutOn := f.pageNo
 	b := newLineBreaker(f.r, p)
 	if b.done() { // empty paragraph advances one line at its line spacing
-		h := lineHeightFor(defaultRenderSizePt, 0, p.Props.Spacing)
+		h := emptyLineHeight(f.r, p.Props)
 		f.lineSlot(ind, h)
 		f.placeAnchors(p.Bookmarks)
 		f.drawSides(bdr, ind, f.y, f.y+h)
@@ -826,17 +836,20 @@ type floatBox struct {
 	wrap           Wrap
 }
 
-// splitFloats takes the floating pictures out of p's runs: they are drawn
-// where their anchor puts them, not in the line.
-func splitFloats(p Paragraph) (Paragraph, []*Image) {
-	if !slices.ContainsFunc(p.Runs, func(r Run) bool { return r.Image != nil && r.Image.Float != nil }) {
+// splitFloats takes the floating pictures and text boxes out of p's runs: they
+// are drawn where their anchor puts them, not in the line.
+func splitFloats(p Paragraph) (Paragraph, []Run) {
+	floating := func(r Run) bool {
+		return r.Image != nil && r.Image.Float != nil || r.TextBox != nil && r.TextBox.Float != nil
+	}
+	if !slices.ContainsFunc(p.Runs, floating) {
 		return p, nil
 	}
-	var floats []*Image
+	var floats []Run
 	runs := make([]Run, 0, len(p.Runs))
 	for _, r := range p.Runs {
-		if r.Image != nil && r.Image.Float != nil {
-			floats = append(floats, r.Image)
+		if floating(r) {
+			floats = append(floats, r)
 			continue
 		}
 		runs = append(runs, r)
@@ -845,13 +858,38 @@ func splitFloats(p Paragraph) (Paragraph, []*Image) {
 	return p, floats
 }
 
-// placeFloat draws a floating picture where its anchor puts it - measured, for
-// a paragraph anchor, from the cursor at the paragraph's top - and keeps the
-// text out of its area from then on.
-func (f *flow) placeFloat(img *Image) {
-	x, y := floatOrigin(f, *img.Float, img.WidthPt, img.HeightPt)
-	drawPicture(f.r, img, x, y)
-	f.addFloat(*img.Float, x, y, img.WidthPt, img.HeightPt)
+// placeFloat draws a floating picture or text box where its anchor puts it -
+// measured, for a paragraph anchor, from the cursor at the paragraph's top -
+// and keeps the text out of its area from then on. One in front of the text
+// is drawn once the page's text is.
+func (f *flow) placeFloat(run Run) {
+	var fl Float
+	var w, h float64
+	var draw func(x, y float64)
+	if img := run.Image; img != nil {
+		fl, w, h = *img.Float, img.WidthPt, img.HeightPt
+		draw = func(x, y float64) { drawPicture(f.r, img, x, y) }
+	} else {
+		tl := layoutTextBox(f.r, *run.TextBox)
+		fl, w, h = *run.TextBox.Float, tl.w, tl.h
+		draw = func(x, y float64) { tl.draw(f.r, x, y) }
+	}
+	x, y := floatOrigin(f, fl, w, h)
+	if fl.InFront {
+		f.front = append(f.front, func() { draw(x, y) })
+	} else {
+		draw(x, y)
+	}
+	f.addFloat(fl, x, y, w, h)
+}
+
+// drawFront draws the floating objects in front of the text on the current
+// page, now that its text is drawn.
+func (f *flow) drawFront() {
+	for _, draw := range f.front {
+		draw()
+	}
+	f.front = nil
 }
 
 // addFloat records the area of a floating object drawn at (x, y), w × h, for
@@ -1014,6 +1052,7 @@ func drawBlock(r renderer, sec Section, elems []BodyElement, x, y, width float64
 	for _, el := range elems {
 		renderElement(f, el)
 	}
+	f.drawFront()
 	return f.y
 }
 
@@ -1029,7 +1068,7 @@ func blockHeight(r renderer, elems []BodyElement, width float64) float64 {
 			h += p.Props.Spacing.BeforePt + p.Props.Spacing.AfterPt + ruleExtent(above) + ruleExtent(below)
 			lines := layoutParagraph(r, p, width-p.Props.Indent.LeftPt-p.Props.Indent.RightPt)
 			if len(lines) == 0 {
-				h += lineHeightFor(defaultRenderSizePt, 0, p.Props.Spacing)
+				h += emptyLineHeight(r, p.Props)
 				continue
 			}
 			for _, ln := range lines {

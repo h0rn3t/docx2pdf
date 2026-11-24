@@ -62,6 +62,25 @@ func TestRightTabOnTheRightMargin(t *testing.T) {
 	}
 }
 
+// A custom stop past the right margin is honored as in Word: the text after it
+// runs into the margin up to the stop instead of wrapping.
+func TestRightTabBeyondTheRightMargin(t *testing.T) {
+	doc := openFixture(t, docxtest.Build(t,
+		`<w:p><w:pPr><w:tabs><w:tab w:val="right" w:leader="dot" w:pos="9900"/></w:tabs></w:pPr>`+
+			`<w:r><w:t>Директор</w:t><w:tab/><w:t>Ім'я ПРІЗВИЩЕ</w:t></w:r></w:p>`+hrSectPr))
+	f := &fakeRenderer{}
+	ConvertToPdf(doc).render(f)
+
+	before, after := drawOf(t, f, "Директор"), drawOf(t, f, "ПРІЗВИЩЕ")
+	if after.y != before.y {
+		t.Errorf("%q drawn at y=%v, %q at y=%v: want one line", "ПРІЗВИЩЕ", after.y, "Директор", before.y)
+	}
+	right := after.x + f.TextWidth("ПРІЗВИЩЕ")
+	if want := 1701.0/20 + 9900.0/20; !near(right, want) {
+		t.Errorf("%q ends at x=%v, want the stop %v", "ПРІЗВИЩЕ", right, want)
+	}
+}
+
 func TestParagraphBorders_Parse(t *testing.T) {
 	bottom := BorderSide{Style: "single", WidthPt: 0.75, Color: "#000000", SpacePt: 2}
 	tests := []struct {
